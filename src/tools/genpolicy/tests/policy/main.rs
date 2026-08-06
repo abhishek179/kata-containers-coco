@@ -352,6 +352,11 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_create_container_image_short_name() {
+        runtests("createcontainer/image_short_name").await;
+    }
+
+    #[tokio::test]
     async fn test_create_container_security_context() {
         runtests("createcontainer/security_context/runas").await;
     }
@@ -369,6 +374,16 @@ mod tests {
     #[tokio::test]
     async fn test_create_container_volumes_empty_dir() {
         runtests("createcontainer/volumes/emptydir").await;
+    }
+
+    #[tokio::test]
+    async fn test_create_container_volumes_empty_dir_memory() {
+        // RM-35 (F-97): a memory-backed emptyDir is declared as an in-guest tmpfs --
+        // driver "ephemeral", source "tmpfs" -- and is not one of the two declarations
+        // that opt into host-chosen block backing. Before RM-35 the blk/scsi bodies of
+        // storage_pair_matches ignored the declaration's driver and source entirely, so
+        // a host-attached disk carrying arbitrary content satisfied this declaration.
+        runtests("createcontainer/volumes/emptydir_memory").await;
     }
 
     #[tokio::test]
