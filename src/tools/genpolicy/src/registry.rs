@@ -37,6 +37,7 @@ pub struct Container {
     pub config_layer: DockerConfigLayer,
     pub passwd: String,
     pub group: String,
+    pub image_layers: Vec<ImageLayer>,
 }
 
 /// Image config layer properties.
@@ -204,7 +205,18 @@ impl Container {
             config_layer,
             passwd,
             group,
+            image_layers,
         })
+    }
+
+    /// RM-38: the image's layers, in manifest order (base layer first).
+    ///
+    /// Only the layer *count* and ordering are used today, to declare how many
+    /// dm-verity backed EROFS lower layers a container may present. The diff_ids are
+    /// retained because they identify the layers independently of how a snapshotter
+    /// happens to package them.
+    pub fn get_image_layers(&self) -> &[ImageLayer] {
+        &self.image_layers
     }
 
     pub fn get_gid_from_passwd_uid(&self, uid: u32) -> Result<u32> {
@@ -805,6 +817,7 @@ mod tests {
                 "root:x:0:0:root:/root:/bin/sh\nwww-data:x:33:33:www-data:/var/www:/sbin/nologin\n"
                     .to_string(),
             group: "root:x:0:\nwww-data:x:33:\nstaff:x:50:\nwheel:x:10:\n".to_string(),
+            image_layers: Vec::new(),
         }
     }
 
