@@ -234,6 +234,14 @@ agent_call() {
   sudo "$CTL" -l error connect --server-address "vsock://$cid:1024" -n true -c "$cmd" 2>&1
 }
 
+# Same, but at info level, so a *successful* reply is visible ("response
+# received"). Refusals are proved by their ttrpc status and need only -l error;
+# successes have no output at that level at all.
+agent_call_verbose() {
+  local cid=$1 cmd=$2
+  sudo "$CTL" -l info connect --server-address "vsock://$cid:1024" -n true -c "$cmd" 2>&1
+}
+
 # expect_refusal <label> <output> <expected-code> <expected-substring>
 expect_refusal() {
   local label=$1 out=$2 code=$3 want=$4
@@ -319,6 +327,41 @@ fi
 
 out=$(agent_call "$REF_CID" "SignalProcess json://{\"container_id\":\"$REF_SB\",\"exec_id\":\"\",\"signal\":28}")
 expect_refusal "08n — the same SIGWINCH(28) is refused for the pause container of the same sandbox (F-76: per-container signal sets)" \
+  "$out" PERMISSION_DENIED 'blocked by policy'
+
+# --- 08o / 08p ---------------------------------------------------------------
+# RM-26: removing a container id the policy never admitted must succeed, exactly
+# once.
+#
+# Refusing it is what left pods stuck in Terminating: when a CreateContainer is
+# denied, the shim's cleanup still issues RemoveContainer for the same id, that
+# was denied too, and the composition had no exit -- every individual decision
+# correct, the pod unkillable. An operator experiences a correctly enforced
+# denial as a hung workload, which is exactly the pressure that gets policies
+# loosened, so this is asserted rather than left to the unit test.
+#
+# 08b directly above is the control that keeps this honest: it uses the *same*
+# ghost id and shows StartContainer for it is still refused. The no-op is scoped
+# to removal -- where there is nothing to act on -- not to unknown ids generally.
+# A successful reply is proved positively rather than by the absence of an error,
+# because kata-agent-ctl's RemoveContainer subcommand unmounts the container's
+# rootfs *on the client side* after the RPC returns -- and for an id that never
+# existed there is nothing to unmount, so the tool exits ENOENT even though the
+# agent answered Ok. That client-side noise is reached only after a successful
+# reply, but grepping for "error" would score it as a failure.
+out=$(agent_call_verbose "$REF_CID" 'RemoveContainer json://{"container_id":"ghost-never-created"}')
+if echo "$out" | grep -q 'response received'; then
+  ok "08o — RemoveContainer for a never-created id succeeds as a no-op (RM-26)"
+else
+  echo "$out"
+  fail_case "08o — RemoveContainer for a never-created id must succeed as a no-op (RM-26), or a denied create leaves the pod stuck Terminating"
+fi
+
+# The no-op still burns the id, so removal stays single-shot however it was
+# admitted (RM-20). A second attempt now carries a tombstone and must be refused
+# -- that is what stops 08o from becoming a general "remove any id" hole.
+out=$(agent_call "$REF_CID" 'RemoveContainer json://{"container_id":"ghost-never-created"}')
+expect_refusal "08p — the second RemoveContainer for the same id is refused: the no-op tombstoned it (RM-20 preserved)" \
   "$out" PERMISSION_DENIED 'blocked by policy'
 
 kubectl delete pod fr9-reference -n "$NS" --ignore-not-found >/dev/null 2>&1 || true
