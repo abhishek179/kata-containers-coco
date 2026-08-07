@@ -367,6 +367,11 @@ snapshotter:
   erofsSnapshotterMode: ""
   # Enable dm-verity integrity verification for EROFS lower layers.
   # Independent of erofsSnapshotterMode — works with both disk and memory.
+  # Requires erofsMergeMode: "unmerged". dm-verity verifies each lower layer as
+  # its own block device, which only exists in the unmerged layout; in merged mode
+  # the dm-verity options are stripped before the storage is built, so layers would
+  # be unverified while appearing to be protected. kata-deploy refuses the
+  # combination rather than deploying it.
   erofsDmverity: false
 
 # Shim configuration

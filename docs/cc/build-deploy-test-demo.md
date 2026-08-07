@@ -74,7 +74,7 @@ runc "cargo build -p kata-agent --no-default-features --features strict-policy -
 
 ```bash
 runc "cargo build --release --target $TGT -p kata-security-reference-monitor \
-  --example sign-fragment --example verify-layer --example verify-image \
+  --example sign-fragment \
   --example mock-ledger --example fragment-demo"
 runc "cargo build --release --target $TGT -p genpolicy-fragmentgen"
 ```
@@ -99,34 +99,15 @@ chain/revocation/rotation, **FR-1j append-only ordering** (in-order accept, out-
 reject, exportable non-repudiable log), and **FR-1f Stage 2** transparency-log inclusion +
 consistency (forged/rewound rejected). Ends with `All FR-1 fragment capabilities verified.`
 
-### 2b. FR-4C verified read-only layers (real dm-verity)
+### 2b/2c. FR-4C / FR-4D — removed (RM-51)
 
-Needs `veritysetup`/`losetup` + root (Linux host):
-
-```bash
-dd if=/dev/urandom of=/tmp/layer.data bs=1M count=8 status=none
-ROOT=$(sudo veritysetup format /tmp/layer.data /tmp/layer.hash | awk '/Root hash:/{print $3}')
-VL=target/$TGT/release/examples/verify-layer
-$VL --algorithm sha256 --require true --authorize "$ROOT" --root-hash "$ROOT"   # AUTHORIZED (exit 0)
-$VL --algorithm sha256 --require true --authorize "$ROOT" --root-hash "$(echo $ROOT | sed s/^../00/)"  # REJECTED (exit 1)
-$VL --algorithm sha256 --require true --root-hash "$ROOT"                        # REJECTED: empty allowlist (fail-closed)
-```
-
-`verify-layer` calls the exact `VerifiedLayerStore::verify` the agent uses before creating a
-dm-verity device.
-
-### 2c. FR-4D verified guest-pull images
-
-`verify-image` calls the exact `VerifiedImageStore::verify`. Use a **full 64-hex** digest
-(short/tag-only refs are rejected as unpinned):
-
-```bash
-VI=target/$TGT/release/examples/verify-image
-D=sha256:$(printf 'a%.0s' {1..64})
-$VI --require true --authorize "$D" --image-ref "reg/img@$D"     # AUTHORIZED
-$VI --require true --authorize "$D" --image-ref "reg/img@sha256:$(printf 'b%.0s' {1..64})"  # REJECTED (unlisted)
-$VI --require true --image-ref "reg/img:1"                       # REJECTED (unpinned/tag-only)
-```
+The `verify-layer` / `verify-image` examples and the `VerifiedLayerStore` /
+`VerifiedImageStore` allowlists they exercised have been removed. Both bindings now live
+in the generated policy: EROFS layer dm-verity root hashes are declared per container and
+per layer (RM-42/RM-44), and guest-pull images are bound by manifest digest, with
+`require_pinned_image_digests` refusing unpinned references. Exercise them through the
+genpolicy policy suite (`createcontainer/erofs_layers`, `createcontainer/require_pinned_images`)
+rather than a standalone binary.
 
 ### 2d. Sign + package/publish a fragment (BL-9)
 
@@ -164,16 +145,39 @@ run in the pinned builder image automatically):
 
 ```bash
 cd tools/packaging/kata-deploy/local-build
-STRICT_POLICY=yes AGENT_POLICY=yes make agent-tarball rootfs-image-tarball genpolicy-tarball
+STRICT_POLICY=yes AGENT_POLICY=yes USE_CACHE=no \
+  make agent-tarball rootfs-image-tarball genpolicy-tarball
 # → build/kata-static-{agent,rootfs-image,genpolicy}.tar.zst
 ```
 
-Verify the strict agent is in the artifact (the guest rootfs embeds it):
+Build the **variant your runtime class actually boots**. A `kata-*-coco-dev` config boots
+`kata-containers-confidential.img`, which comes from `rootfs-image-confidential-tarball` — the
+plain `rootfs-image-tarball` above produces the *base* image and will not affect it.
+
+`USE_CACHE=no` is deliberate: the default (`yes`) pulls prebuilt `cached-artefacts/agent` and
+`cached-artefacts/rootfs-image` from `ghcr.io/kata-containers` over the local build, and the
+hardening flags are not part of any stage's cache identity.
+
+Verify the strict agent is in the artifact. Check the **built image**, not the tarball:
+`make rootfs-image-tarball` does not reliably regenerate `kata-static-rootfs-image.tar.zst`,
+so grepping the tarball routinely reads a stale artifact from a previous build.
 
 ```bash
-tar --zstd -xOf build/kata-static-rootfs-image.tar.zst 2>/dev/null | strings \
-  | grep -m1 "boot fragment pull failed, aborting VM"   # BL-8 string present ⇒ strict build
+IMG=build/rootfs-image/destdir/opt/kata/share/kata-containers/kata-ubuntu-noble.image
+stat -c '%y' "$IMG"                      # confirm this is from the build you just ran
+sudo mount -o loop,ro "$IMG" /mnt && strings /mnt/usr/bin/kata-agent > /tmp/ag.txt
+
+grep -c "strict-policy: no explicit policy provided" /tmp/ag.txt   # ≥1 ⇒ strict build
+grep -c "verification read failed" /tmp/ag.txt                     # ≥1 ⇒ dm-verity compiled in
+grep -c "dm-verity support not compiled in" /tmp/ag.txt            #  0 ⇒ not the stub
+sudo umount /mnt
 ```
+
+The last two matter as much as the first: `STRICT_POLICY=yes` now implies `USE_DEVMAPPER=yes`
+(strict requires every EROFS lower layer to be dm-verity protected, and without the
+`devicemapper` feature the code that would set those devices up is a stub that always fails —
+so the combination without it refuses every confidential pod). If the stub string is present,
+the flag did not reach the agent build and the whole verification chain is dead code.
 
 Install onto the node and register a strict RuntimeClass (**environment-specific** — adapt
 paths/handler to your Kata install):
@@ -195,7 +199,7 @@ for c in agent rootfs-image genpolicy; do sudo tar --zstd -xf build/kata-static-
 Two knobs make a strict guest testable:
 
 1. **Measured trust roots** — the guest reads `/etc/kata/fragment-issuers.toml`,
-   `/etc/kata/verified-layers.toml`, `/etc/kata/verified-images.toml` from measured state (or,
+   measured state (or,
    per BL-5, from the initdata measured section). Provide the authorized issuer/ledger keys and
    allowlists there.
 2. **Fragment delivery** — either **runtime push** (`kata-agent-ctl` `LoadPolicyFragment` over
@@ -237,8 +241,8 @@ GOOD/BAD cases to demonstrate (all shown live in the operator harnesses):
 | FR-1f / **BL-6** SCITT/CCF receipts | ✅ `ccf::` | `mock-ledger prove-ccf` | CCF `receipt_proof` |
 | FR-1j append-only ordering | ✅ `fragments::` | `fragment-demo` | ordered fragments |
 | **BL-2** multi-alg signatures | ✅ `cose_keys::` | — | — |
-| **FR-4C** verified dm-verity layers | ✅ `verified_layers::` | `verify-layer` + real `veritysetup` | verity mount |
-| **FR-4D** verified guest-pull images | ✅ `verified_images::` | `verify-image` | CDH guest-pull |
+| **FR-4C** verified dm-verity layers | ✅ policy-declared root hashes (RM-42/RM-44) | genpolicy `erofs_layers` suite | verity mount |
+| **FR-4D** verified guest-pull images | ✅ policy manifest-digest binding (RM-51) | genpolicy `require_pinned_images` suite | CDH guest-pull |
 | **BL-8** boot-time OCI fragment pull | ✅ policy `fragment_specs` | — | fail-closed boot |
 | **BL-9** OCI packaging/push | — | `genpolicy-fragmentgen` | push + boot-pull |
 | **BL-5** measured-initdata trust roots | ✅ `initdata::` | — | initdata keys |
@@ -256,7 +260,8 @@ GOOD/BAD cases to demonstrate (all shown live in the operator harnesses):
   initdata.
 - **Plain-HTTP registries.** The boot-pull fetcher allows plain HTTP only for
   `localhost`/loopback; any other registry must be HTTPS with a guest-trusted CA.
-- **`verify-image` digests** must be well-formed `alg:hex` (sha256=64, sha384=96, sha512=128
-  hex chars); anything else is treated as unpinned and rejected.
+- **Guest-pull image references** must be digest-pinned (`name@alg:hex`) wherever
+  `require_pinned_image_digests` is set; a tag-only reference matches no policy rule and is
+  denied (RM-51).
 - **Transient crates.io fetch timeouts** in the builder image — set `CARGO_NET_RETRY=20` and
   retry.
