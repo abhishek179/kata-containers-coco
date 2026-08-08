@@ -134,10 +134,17 @@ build_component() {
   # extension image reads its inputs from there and dies on a bare
   # `tar: Cannot open` if they are missing. Stage every component we build, so
   # that adding one later cannot reintroduce this.
+  #
+  # In some trees `build/` is itself a symlink to $LB/build, so the two paths name
+  # the same file and `cp` refuses. That is the desired end state, not an error:
+  # compare resolved directories and skip the copy rather than reporting a staging
+  # failure for a component that is already exactly where it needs to be.
   local t="build/kata-static-$comp.tar.zst"
   if [ -f "$t" ]; then
     mkdir -p "$LB/build"
-    cp "$t" "$LB/build/" || die "could not stage $t for later components"
+    if [ "$(cd "$(dirname "$t")" && pwd -P)" != "$(cd "$LB/build" && pwd -P)" ]; then
+      cp "$t" "$LB/build/" || die "could not stage $t for later components"
+    fi
   fi
 }
 
