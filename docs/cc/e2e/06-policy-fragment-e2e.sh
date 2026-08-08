@@ -346,8 +346,8 @@ $(sed 's/^/      /' "$WORK/fragment-issuers.toml")
 
     Note there is no log to read for this. A strict guest discards its own log
     stream rather than forwarding it to the host (FR-7 / F-79), so
-    `journalctl -t kata` shows the shim's view only. To watch the guest side,
-    rebuild the agent without the `strict-policy` feature.
+    \`journalctl -t kata\` shows the shim's view only. To watch the guest side,
+    rebuild the agent without the \`strict-policy\` feature.
 
 EOF
 
