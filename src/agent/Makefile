@@ -41,6 +41,14 @@ ifeq ($(AGENT_POLICY),yes)
     override EXTRA_RUSTFEATURES += agent-policy
 endif
 
+##VAR STRICT_POLICY=yes|no enable the strict confidential-runtime policy behaviour
+## (closed-door default baseline + escape hatch compiled out). Implies AGENT_POLICY.
+STRICT_POLICY ?= no
+
+ifeq ($(STRICT_POLICY),yes)
+    override EXTRA_RUSTFEATURES += strict-policy
+endif
+
 ##VAR INIT_DATA=yes|no define if agent enables the init data feature
 INIT_DATA ?= yes
 
@@ -50,7 +58,15 @@ ifeq ($(INIT_DATA),yes)
 endif
 
 ##VAR USE_DEVMAPPER=yes|no define if agent enables dm-verity (devicemapper) support
+## Implied by STRICT_POLICY: strict requires every erofs lower layer to be dm-verity
+## protected (require_verity_for_lower_layers), and without this feature the device
+## creation path is a stub that always errors, so STRICT_POLICY=yes USE_DEVMAPPER=no
+## builds an agent that refuses every confidential pod. Fail-closed, but unusable.
 USE_DEVMAPPER ?= no
+
+ifeq ($(STRICT_POLICY),yes)
+    override USE_DEVMAPPER = yes
+endif
 
 # Enable the devicemapper feature (links libdevmapper for dm-verity) with GNU libc
 ifeq ($(USE_DEVMAPPER),yes)
@@ -158,8 +174,12 @@ clean:
 	@rm -f tarpaulin-report.html
 
 #TARGET test: run cargo tests
+# `-p kata-security-reference-monitor` is listed explicitly: the reference monitor is a
+# separate crate, so testing only `kata-agent` left its entire suite unrun in CI. That is
+# the crate carrying the FR-6 transaction lifecycle, which is exactly the logic the
+# hardening depends on being correct.
 test: $(GENERATED_FILES)
-	@RUST_LIB_BACKTRACE=0 RUST_BACKTRACE=1 cargo test -p kata-agent --target $(TRIPLE) $(EXTRA_RUSTFEATURES) -- --nocapture
+	@RUST_LIB_BACKTRACE=0 RUST_BACKTRACE=1 cargo test -p kata-agent -p kata-security-reference-monitor --target $(TRIPLE) $(EXTRA_RUSTFEATURES) -- --nocapture
 
 ##TARGET check: run test
 check: $(GENERATED_FILES) standard_rust_check

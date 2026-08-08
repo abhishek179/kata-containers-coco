@@ -65,6 +65,17 @@ const CONTAINERD_DEFAULT_DMVERITY_SALT: &str =
     "0000000000000000000000000000000000000000000000000000000000000000";
 /// Maximum expected size of dm-verity metadata JSON file (arbitrary limit to prevent abuse)
 const MAX_DMVERITY_METADATA_SIZE: u64 = 65536;
+/// dm-verity data and hash block size used by containerd's EROFS differ in its
+/// default (`--tar=f`) mode.
+///
+/// containerd does not record this in the `.dmverity` sidecar, so it was previously
+/// an undeclared agreement between the differ's default and the agent's fallback
+/// constant: the agent computed `blocknum = hashoffset / blocksize` from a value
+/// nobody had told it. It is now emitted explicitly so the policy can pin it and a
+/// divergence surfaces as a policy denial rather than a corrupt verity table.
+///
+/// Note that containerd forces 512 in tar-index mode; see RM-49.
+pub const DEFAULT_DMVERITY_BLOCK_SIZE: u32 = 4096;
 
 /// Represents a read-only EROFS layer to be placed in a GPT partition
 #[derive(Debug, Clone)]
@@ -123,6 +134,15 @@ pub struct DmVerityMetadata {
     /// Salt value for dm-verity (hex-encoded, optional).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub salt: Option<String>,
+    /// Data block size in bytes. containerd does not currently write this into the
+    /// sidecar, so it is optional and falls back to
+    /// [`DEFAULT_DMVERITY_BLOCK_SIZE`]. The field exists so that the value travels
+    /// with the metadata if containerd ever starts emitting it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocksize: Option<u32>,
+    /// Hash block size in bytes. See [`DmVerityMetadata::blocksize`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hashsize: Option<u32>,
 }
 
 /// Parse dm-verity metadata from a JSON file
@@ -269,6 +289,18 @@ pub fn generate_dmverity_options(
         format!("X-kata.dmverity.roothash={}", metadata.roothash),
         format!("X-kata.dmverity.hashoffset={}", metadata.hashoffset),
         format!("X-kata.dmverity.no-superblock={}", no_superblock),
+        // Emit the geometry explicitly. The agent has always understood these
+        // options but nothing ever sent them, so it fell back to 4096 and happened
+        // to be right only because the differ runs in its default mode. Stating them
+        // makes the value reviewable in the policy instead of implicit.
+        format!(
+            "X-kata.dmverity.blocksize={}",
+            metadata.blocksize.unwrap_or(DEFAULT_DMVERITY_BLOCK_SIZE)
+        ),
+        format!(
+            "X-kata.dmverity.hashsize={}",
+            metadata.hashsize.unwrap_or(DEFAULT_DMVERITY_BLOCK_SIZE)
+        ),
     ];
 
     let salt_resolved = if let Some(ref salt_hex) = metadata.salt {
@@ -669,4 +701,53 @@ pub fn generate_padding_file(output_path: &Path, size_sectors: u64) -> Result<u6
     );
 
     Ok(size_sectors)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn metadata() -> DmVerityMetadata {
+        DmVerityMetadata {
+            roothash: "a".repeat(64),
+            hashoffset: 8134656,
+            salt: None,
+            blocksize: None,
+            hashsize: None,
+        }
+    }
+
+    /// RM-48: the verity geometry must be stated, not inferred. The agent computes
+    /// `blocknum = hashoffset / blocksize`, so leaving the block size to a built-in
+    /// default means a security-relevant divisor that never appears in the policy.
+    #[test]
+    fn dmverity_options_always_declare_the_geometry() {
+        let options = generate_dmverity_options(&metadata(), None);
+        assert!(options.contains(&"X-kata.dmverity.blocksize=4096".to_string()));
+        assert!(options.contains(&"X-kata.dmverity.hashsize=4096".to_string()));
+    }
+
+    /// When containerd starts recording the geometry in the sidecar, that value must
+    /// win over our fallback -- otherwise enabling tar-index mode (which forces 512)
+    /// would produce a table that silently disagrees with the device.
+    #[test]
+    fn dmverity_options_prefer_the_sidecar_geometry() {
+        let mut md = metadata();
+        md.blocksize = Some(512);
+        md.hashsize = Some(512);
+        let options = generate_dmverity_options(&md, None);
+        assert!(options.contains(&"X-kata.dmverity.blocksize=512".to_string()));
+        assert!(options.contains(&"X-kata.dmverity.hashsize=512".to_string()));
+        assert!(!options.iter().any(|o| o.ends_with("blocksize=4096")));
+    }
+
+    /// A sidecar that omits the fields must still deserialize; containerd does not
+    /// write them today, so requiring them would break every real image.
+    #[test]
+    fn dmverity_metadata_parses_without_geometry() {
+        let md: DmVerityMetadata =
+            serde_json::from_str(r#"{"roothash":"abc","hashoffset":4096}"#).unwrap();
+        assert_eq!(md.blocksize, None);
+        assert_eq!(md.hashsize, None);
+    }
 }

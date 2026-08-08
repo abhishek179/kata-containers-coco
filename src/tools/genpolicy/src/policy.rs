@@ -17,7 +17,7 @@ use crate::utils;
 use crate::yaml;
 
 use anyhow::Result;
-use log::debug;
+use log::{debug, warn};
 use oci_spec::runtime as oci;
 use protocols::agent;
 use serde::{Deserialize, Serialize};
@@ -47,11 +47,72 @@ pub struct AgentPolicy {
     pub config: utils::Config,
 }
 
+/// A trusted policy fragment reference: composed fragments are gated by
+/// issuer, feed and a minimum acceptable security version number (SVN).
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct FragmentSpec {
+    pub issuer: String,
+    pub feed: String,
+    pub minimum_svn: i64,
+
+    /// BL-8: whether the guest must refuse to create containers until this fragment has
+    /// been delivered and verified. Optional in the settings and defaulting to false, which
+    /// is C-ACI/hcsshim behaviour — the declaration authorizes the fragment and fixes the
+    /// terms it must meet, but its absence is tolerated because an undelivered fragment
+    /// simply grants nothing. Set it only for fragments whose absence is not fail-safe.
+    #[serde(default)]
+    pub required: bool,
+
+    /// BL-8: whether this fragment may itself declare further fragments, and whose. Passed
+    /// through verbatim so the agent validates it — genpolicy has no trust context with
+    /// which to judge an issuer scope, and a settings-time check here would only be a
+    /// second place to keep the accepted forms in sync. Omitted from the emitted policy
+    /// when unset, so existing settings produce byte-identical output.
+    ///
+    /// Accepted forms: `false`, `"none"`, `"same-issuer"`, `"any-authorized"`, or a list of
+    /// issuer strings. Bare `true` is rejected by the agent, because it enables delegation
+    /// without saying to whom.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_nested: Option<serde_json::Value>,
+
+    /// FR-1c (F-62): policy namespaces under `agent_policy.fragments.` this fragment may
+    /// contribute a module to. The fragment's own signed `includes` cannot widen this — the
+    /// effective scope is the intersection — so the measured policy stays in control of
+    /// which issuer may populate which namespace. Omitted when unset.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub includes: Vec<String>,
+
+    /// FR-1c: whether the fragment's Rego module may be applied at all. Defaults to true;
+    /// `false` accepts the fragment for its SVN/receipt/ordering record while contributing
+    /// no rules. Emitted only when explicitly disabled, so existing settings produce
+    /// byte-identical output.
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub allow_module: bool,
+
+    /// FR-1k: values to instantiate a parameterised fragment with, passed through verbatim.
+    /// The fragment reads them via `parameter("name")`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parameters: Option<serde_json::Value>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn is_true(b: &bool) -> bool {
+    *b
+}
+
 /// Representation of the policy_data field from the output policy text.
 #[derive(Debug, Serialize)]
 pub struct PolicyData {
     /// Policy properties for each container allowed to be executed in a pod.
     pub containers: Vec<ContainerPolicy>,
+
+    /// Trusted policy fragments (issuer/feed/minimum_svn) composed into this
+    /// policy's allowed container set. Empty ⇒ behaviour identical to a
+    /// monolithic policy (no fragment composition).
+    pub fragments: Vec<FragmentSpec>,
 
     /// Settings read from genpolicy-settings.json.
     pub common: CommonData,
@@ -139,6 +200,38 @@ pub struct KataProcess {
     /// NoNewPrivileges controls whether additional privileges could be gained by processes in the container.
     #[serde(default)]
     pub NoNewPrivileges: bool,
+
+    /// Rlimits specifies rlimit options to apply to the process. Modeled so the
+    /// policy can exact-match the rlimits forwarded by the host, instead of
+    /// leaving them unconstrained.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub Rlimits: Vec<KataPosixRlimit>,
+
+    /// ApparmorProfile is the expected apparmor profile for the container.
+    /// Modeled as an Option so the policy can exact-match a profile the pod spec
+    /// pins (or that an operator configures via settings), while leaving it
+    /// unconstrained (None -> field omitted) when no expected value is known -
+    /// the emitted profile for the RuntimeDefault case depends on whether
+    /// apparmor is enabled on the host, which is not derivable from the pod spec.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ApparmorProfile: Option<String>,
+}
+
+/// OCI POSIXRlimit struct, mirroring the POSIXRlimit message from oci.proto,
+/// preserving the upper case field names for consistency with agent's rpc.rs.
+#[derive(Serialize, Deserialize, Debug, Default, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct KataPosixRlimit {
+    /// Type of the rlimit to set.
+    #[serde(default)]
+    pub Type: String,
+
+    /// Hard is the hard limit for the specified type.
+    #[serde(default)]
+    pub Hard: u64,
+
+    /// Soft is the soft limit for the specified type.
+    #[serde(default)]
+    pub Soft: u64,
 }
 
 /// OCI container User struct. This struct is very similar to the User
@@ -289,6 +382,13 @@ pub struct ContainerPolicy {
 
     /// Runtime-assigned annotation key-value pairs for validation of input annotations.
     runtime_anno_patterns: BTreeMap<String, String>,
+
+    /// F-76: signal numbers `SignalProcessRequest` may deliver to *this* container,
+    /// mirroring hcsshim's per-container `securityPolicyContainer.Signals`. Enforced in
+    /// addition to the sandbox-wide `request_defaults.SignalProcessRequest.allowed_signals`
+    /// ceiling, so a container (including one carried by a policy fragment) is signalable
+    /// only with what its own declaration admits.
+    allowed_signals: Vec<u32>,
 }
 
 /// See Reference / Kubernetes API / Config and Storage Resources / Volume.
@@ -380,9 +480,85 @@ pub struct AddARPNeighborsRequestDefaults {
     allowed_states: Vec<u32>,
 }
 
+/// SignalProcessRequest settings from genpolicy-settings.json.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SignalProcessRequestDefaults {
+    /// Signal numbers the Host is allowed to send to Guest container processes.
+    /// Any signal not in this list is rejected, and signals targeting a container
+    /// that was not created under this policy are rejected regardless of the signal.
+    ///
+    /// This is the sandbox-wide *ceiling*: `rules.rego` requires a signal to be in this
+    /// list **and** in the target container's own `allowed_signals` (F-76), so a policy
+    /// fragment can never widen the set beyond what the measured base policy admits.
+    pub allowed_signals: Vec<u32>,
+
+    /// Optional narrower set for the pause (sandbox) container, whose only lifecycle
+    /// signals are stop and kill. Absent means "same as `allowed_signals`".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pause_container_allowed_signals: Option<Vec<u32>>,
+}
+
+impl SignalProcessRequestDefaults {
+    /// Per-container signal set emitted into the generated policy (F-76 / hcsshim
+    /// `securityPolicyContainer.Signals` parity). Precedence:
+    ///
+    /// 1. the container's own `lifecycle.stopSignal`, plus SIGKILL, which the kubelet
+    ///    always retains as the ungraceful fallback after the termination grace period;
+    /// 2. `pause_container_allowed_signals` for the pause container;
+    /// 3. the sandbox-wide `allowed_signals`.
+    ///
+    /// The result is always intersected with `allowed_signals` by `rules.rego`, so no
+    /// path here can widen the sandbox ceiling.
+    pub fn signals_for_container(&self, is_pause_container: bool, stop_signal: Option<u32>) -> Vec<u32> {
+        if let Some(signal) = stop_signal {
+            let mut signals = vec![signal];
+            if signal != SIGKILL {
+                signals.push(SIGKILL);
+            }
+            signals.sort_unstable();
+            return signals;
+        }
+
+        if is_pause_container {
+            if let Some(signals) = &self.pause_container_allowed_signals {
+                return signals.clone();
+            }
+        }
+
+        self.allowed_signals.clone()
+    }
+}
+
+const SIGKILL: u32 = 9;
+
+/// Default signal allowlist used when `SignalProcessRequest` is absent from
+/// genpolicy-settings.json. Covers the standard container-lifecycle signals
+/// (SIGHUP/INT/QUIT/KILL/USR1/USR2/TERM/WINCH) while rejecting less common signals that
+/// a malicious Host could otherwise inject into a workload.
+///
+/// SIGSTOP(19) and SIGCONT(18) are deliberately **not** here (F-77): nothing in the CRI
+/// lifecycle sends them -- `docker pause` and the CRI equivalents use the cgroup freezer,
+/// not signals -- while admitting them lets a malicious Host freeze any workload process
+/// indefinitely (an availability attack) and single-step it for timing observation.
+fn default_signal_process_request() -> SignalProcessRequestDefaults {
+    SignalProcessRequestDefaults {
+        allowed_signals: vec![1, 2, 3, 9, 10, 12, 15, 28],
+        pause_container_allowed_signals: None,
+    }
+}
+
 /// Settings specific to each kata agent endpoint, loaded from
 /// genpolicy-settings.json.
+///
+/// `deny_unknown_fields` is load-bearing, not hygiene (RM-21). These settings are
+/// deserialized here and then *re-serialized* into the generated policy, so a key this
+/// binary does not know would be dropped silently -- and `rules.rego` reads several of
+/// them by path. When `SignalProcessRequest.allowed_signals` went missing that way, the
+/// signal rule became undefined, every signal was denied fail-closed, and no pod on the
+/// cluster could be killed. Failing at generation time turns a version skew between the
+/// binary, `rules.rego` and `genpolicy-settings.json` into an error a human reads.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RequestDefaults {
     /// Settings for CreateContainerRequest.
     pub CreateContainerRequest: CreateContainerRequestDefaults,
@@ -401,6 +577,10 @@ pub struct RequestDefaults {
 
     /// Allow the host to configure only used raw_flags and reject names/mac addresses of the loopback.
     pub AddARPNeighborsRequest: AddARPNeighborsRequestDefaults,
+
+    /// Signals the Host is allowed to send to Guest container processes via SignalProcess.
+    #[serde(default = "default_signal_process_request")]
+    pub SignalProcessRequest: SignalProcessRequestDefaults,
 
     /// Allow the Host to close stdin for a container. Typically used with WriteStreamRequest.
     pub CloseStdinRequest: bool,
@@ -450,6 +630,54 @@ pub struct CommonData {
 
     /// Default capabilities for a privileged container.
     pub privileged_caps: Vec<String>,
+
+    /// RM-38: how the guest's read-only image layers are expected to be verified.
+    ///
+    /// * `"none"` (default) — emit no layer declarations. The guest's only trust root
+    ///   for layer content is whatever the initdata supplies.
+    /// * `"host-erofs-dm-verity"` — the host presents each image layer as its own
+    ///   dm-verity backed EROFS lower layer (containerd's erofs snapshotter in
+    ///   *unmerged* mode). Declare one storage per layer so the policy pins how many
+    ///   lower layers a container may present and requires every one of them to be
+    ///   verity backed.
+    ///
+    /// The name and the "none" default are inherited from the upstream setting that
+    /// once selected the tarfs equivalent; the key survived the removal of that code
+    /// with no field behind it, so until now any value here was silently ignored.
+    #[serde(default = "default_image_layer_verification")]
+    pub image_layer_verification: String,
+
+    /// RM-51: require every guest-pull image reference to be pinned by a manifest digest.
+    ///
+    /// Guest pull (`image_guest_pull`) unpacks into the guest's own filesystem, so there
+    /// is no read-only block device and no dm-verity root hash to bind — the manifest
+    /// digest is the *only* thing that identifies the content, and pinning it transitively
+    /// pins every layer digest the manifest lists. A tag names whatever the host chooses to
+    /// serve.
+    ///
+    /// The guest used to catch unpinned references separately, in
+    /// `VerifiedImageStore::authorize`; that store has been removed in favour of the policy
+    /// carrying the binding, so this is where the requirement lives now.
+    ///
+    /// Defaults to `false` so that tag-based pod specs keep working on non-strict
+    /// deployments. Strict/PARMA deployments must set this to `true`.
+    #[serde(default)]
+    pub require_pinned_image_digests: bool,
+
+    /// Expected apparmor profile for containers whose pod spec does not pin a
+    /// specific (Localhost/Unconfined) profile. Defaults to empty, meaning the
+    /// apparmor profile is left unconstrained for such containers, because the
+    /// profile emitted for the RuntimeDefault case depends on whether apparmor
+    /// is enabled on the host (not derivable from the pod spec). Set this to the
+    /// host's runtime-default profile name (e.g. "cri-containerd.apparmor.d") to
+    /// exact-match it cluster-wide.
+    #[serde(default)]
+    pub default_apparmor_profile: String,
+
+    /// Expected rlimits forwarded by the host. Defaults to empty (enforce that no
+    /// rlimits are set). Populate for environments that inject default rlimits.
+    #[serde(default)]
+    pub default_rlimits: Vec<KataPosixRlimit>,
 }
 
 /// Configuration from "kubectl config".
@@ -647,6 +875,7 @@ impl AgentPolicy {
 
         let policy_data = policy::PolicyData {
             containers: policy_containers,
+            fragments: self.config.settings.fragments.clone(),
             request_defaults: self.config.settings.request_defaults.clone(),
             common: self.config.settings.common.clone(),
             sandbox: self.config.settings.sandbox.clone(),
@@ -681,7 +910,13 @@ impl AgentPolicy {
             .settings
             .get_container_settings(is_pause_container);
         let mut root = c_settings.Root.clone();
-        root.Readonly = yaml_container.read_only_root_filesystem();
+        // The pause container is not described by any Kubernetes container spec, so it has no
+        // securityContext to read `readOnlyRootFilesystem` from. Applying the app container's
+        // flag to it produces a policy the runtime can never satisfy when the sandbox rootfs is
+        // a read-only block device (host-pulled EROFS layers), so keep the settings value.
+        if !is_pause_container {
+            root.Readonly = yaml_container.read_only_root_filesystem();
+        }
 
         let namespace = resource.get_namespace().unwrap_or_default();
 
@@ -717,6 +952,11 @@ impl AgentPolicy {
         );
 
         let mut storages = Default::default();
+        get_erofs_layer_storages(
+            &mut storages,
+            &self.config.settings.common.image_layer_verification,
+            yaml_container.registry.get_image_layers(),
+        );
         resource.get_container_mounts_and_storages(
             &mut mounts,
             &mut storages,
@@ -742,6 +982,12 @@ impl AgentPolicy {
             resource.use_sandbox_pidns()
         };
         let exec_commands = yaml_container.get_exec_commands();
+        let allowed_signals = self
+            .config
+            .settings
+            .request_defaults
+            .SignalProcessRequest
+            .signals_for_container(is_pause_container, yaml_container.get_stop_signal());
 
         let mut devices: Vec<agent::Device> = vec![];
         if let Some(volumeDevices) = &yaml_container.volumeDevices {
@@ -850,6 +1096,7 @@ impl AgentPolicy {
             sandbox_pidns,
             exec_commands,
             runtime_anno_patterns,
+            allowed_signals,
         }
     }
 
@@ -1343,13 +1590,9 @@ fn get_container_annotations(
     }
 
     if !is_pause_container {
-        let mut image_name = yaml_container.image.clone();
-        if image_name.find(':').is_none() {
-            image_name += ":latest";
-        }
         annotations
             .entry("io.kubernetes.cri.image-name".to_string())
-            .or_insert(image_name);
+            .or_insert(normalize_image_reference(&yaml_container.image));
     }
 
     annotations.insert(
@@ -1386,6 +1629,113 @@ fn add_missing_strings(src: &Vec<String>, dest: &mut Vec<String>) {
     debug!("src = {:?}, dest = {:?}", src, dest)
 }
 
+fn default_image_layer_verification() -> String {
+    IMAGE_LAYER_VERIFICATION_NONE.to_string()
+}
+
+pub const IMAGE_LAYER_VERIFICATION_NONE: &str = "none";
+pub const IMAGE_LAYER_VERIFICATION_EROFS_DM_VERITY: &str = "host-erofs-dm-verity";
+
+/// Marker driver for a declared EROFS lower layer.
+///
+/// The presented storage's real driver is a block driver chosen at runtime (`blk`,
+/// `scsi`, `mmioblk`, ...), so the declaration cannot name it. This marker instead tells
+/// `rules.rego` which matching rule applies, in the same spirit as the empty
+/// driver/source that marks a host-chosen emptyDir device.
+pub const EROFS_VERITY_LAYER_DRIVER: &str = "erofs-verity-layer";
+
+/// dm-verity data and hash block size for containerd's EROFS differ in its default
+/// (`--tar=f`) mode. Must track `kata_types::gpt_disk::DEFAULT_DMVERITY_BLOCK_SIZE`;
+/// a mismatch shows up immediately as a policy denial rather than silently.
+pub const EROFS_VERITY_BLOCK_SIZE: u32 = 4096;
+
+/// RM-38/RM-42: declare one dm-verity backed EROFS lower layer per image layer.
+///
+/// In unmerged mode containerd gives each image layer its own `layer.erofs`, and
+/// runtime-rs presents each as a GPT partition of a single VMDK block device, carrying
+/// the layer's dm-verity parameters in `X-kata.dmverity.*` storage options. Nothing in
+/// the generated policy described those storages, so a policy-enforcing guest could not
+/// run an EROFS workload at all, and the layers a container mounted were constrained
+/// only by the initdata trust store.
+///
+/// Two things are declared. The *shape*: how many lower layers there are, that each is
+/// EROFS, that each must be dm-verity backed, and where they mount. The layer count
+/// comes from the image manifest, so a host cannot add an extra lower layer to a
+/// container's stack, nor drop one, without the count disagreeing. And, when the layer
+/// carries a derived `verity_hash`, the *content*: the exact dm-verity root hash that
+/// layer must present, which binds the mounted bytes to the image the policy was
+/// generated for rather than merely requiring that some verity device be present.
+///
+/// The root hash is derived by rebuilding the layer's EROFS image locally with
+/// containerd's own `mkfs.erofs` invocation (see `crate::erofs`), which is reproducible
+/// for a fixed erofs-utils version. When derivation is unavailable or disabled the hash
+/// is empty and only the shape is enforced, leaving the root hash's authenticity to the
+/// initdata trust store as before.
+fn get_erofs_layer_storages(
+    storages: &mut Vec<agent::Storage>,
+    image_layer_verification: &str,
+    image_layers: &[crate::registry::ImageLayer],
+) {
+    if image_layer_verification != IMAGE_LAYER_VERIFICATION_EROFS_DM_VERITY {
+        return;
+    }
+
+    debug!("Declaring {} erofs dm-verity lower layers", image_layers.len());
+
+    // Number the partitions topmost layer first. `image_layers` is in OCI manifest order
+    // (base first), but the runtime assigns GPT partitions in the order containerd's
+    // snapshotter lists the erofs mounts, which is overlayfs lowerdir order -- topmost
+    // first. Numbering base-first made the declared partition number disagree with the
+    // presented one for every image with more than one layer, so the policy could never
+    // be satisfied even when the root hashes matched exactly.
+    for (index, layer) in image_layers.iter().rev().enumerate() {
+        let partition_number = index + 1;
+        let mut options = vec![
+            "X-kata.overlay-lower".to_string(),
+            "X-kata.multi-layer=true".to_string(),
+            "X-kata.gpt-partitioned=true".to_string(),
+            format!("X-kata.partition-number={partition_number}"),
+            "X-kata.dmverity-enabled=true".to_string(),
+            // Pin the verity geometry (RM-48). The agent derives
+            // `blocknum = hashoffset / blocksize`, so an undeclared block size means a
+            // host-chosen divisor feeding a security-relevant calculation. These are
+            // static for containerd's default differ mode, so declaring them literally
+            // requires an exact match.
+            format!("X-kata.dmverity.blocksize={EROFS_VERITY_BLOCK_SIZE}"),
+            format!("X-kata.dmverity.hashsize={EROFS_VERITY_BLOCK_SIZE}"),
+        ];
+
+        // Every declared layer must carry a derived root hash. Both registry paths
+        // hard-fail if derivation is unavailable, so an empty hash here means an
+        // invariant was broken rather than that the user opted out. Emitting the
+        // declaration anyway would silently regress to the pre-RM-42 behaviour --
+        // "some dm-verity device" rather than "this content" -- which is exactly
+        // the gap this option closes, so fail loudly instead.
+        assert!(
+            !layer.verity_hash.is_empty(),
+            "layer {} of the image has no derived dm-verity root hash, but \
+             image_layer_verification is {IMAGE_LAYER_VERIFICATION_EROFS_DM_VERITY}; \
+             refusing to generate a policy that would accept any verity device",
+            layer.diff_id,
+        );
+        options.push(format!("X-kata.dmverity.roothash={}", layer.verity_hash));
+
+        storages.push(agent::Storage {
+            driver: EROFS_VERITY_LAYER_DRIVER.to_string(),
+            driver_options: Vec::new(),
+            // Assigned by the host at runtime: the guest device path for the VMDK that
+            // spans every partition. Every layer of a container shares it.
+            source: String::new(),
+            fstype: "erofs".to_string(),
+            options,
+            mount_point: "^$(cpath)/$(bundle-id)/rootfs$".to_string(),
+            fs_group: protobuf::MessageField::none(),
+            shared: false,
+            special_fields: ::protobuf::SpecialFields::new(),
+        });
+    }
+}
+
 pub fn get_kata_namespaces(
     is_pause_container: bool,
     use_host_network: bool,
@@ -1408,4 +1758,256 @@ pub fn get_kata_namespaces(
     });
 
     namespaces
+}
+
+/// Normalize a pod-spec image reference into the canonical form the container
+/// runtime presents at CreateContainer time.
+///
+/// The runtime does not echo back the string from the pod spec. containerd
+/// resolves the image and reports its canonical name, so a pod spec that says
+/// `busybox:latest` arrives as `docker.io/library/busybox:latest`. Because the
+/// guest-pull rules compare the declared image against the presented one, the
+/// policy has to declare the same spelling or every unqualified Docker Hub
+/// reference is denied.
+fn normalize_image_reference(image: &str) -> String {
+    match image.parse::<oci_client::Reference>() {
+        Ok(reference) => reference.whole(),
+        Err(e) => {
+            warn!("Failed to parse image reference {image}: {e}. Using it verbatim.");
+            let mut image_name = image.to_string();
+            if image_name.find(':').is_none() {
+                image_name += ":latest";
+            }
+            image_name
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_image_reference;
+    use super::{
+        get_erofs_layer_storages, IMAGE_LAYER_VERIFICATION_EROFS_DM_VERITY,
+        IMAGE_LAYER_VERIFICATION_NONE,
+    };
+    use crate::registry::ImageLayer;
+
+    /// `count` layers, each carrying a distinct derived root hash.
+    fn layers_with_hashes(count: usize) -> Vec<ImageLayer> {
+        (0..count)
+            .map(|i| ImageLayer {
+                diff_id: format!("sha256:diff{i}"),
+                passwd: String::new(),
+                group: String::new(),
+                verity_hash: format!("{:02x}", i).repeat(32),
+                verity_key: "test".to_string(),
+            })
+            .collect()
+    }
+
+    /// `count` layers with no derived hash, as when derivation is disabled.
+    fn layers_without_hashes(count: usize) -> Vec<ImageLayer> {
+        (0..count)
+            .map(|i| ImageLayer {
+                diff_id: format!("sha256:diff{i}"),
+                passwd: String::new(),
+                group: String::new(),
+                verity_hash: String::new(),
+                verity_key: String::new(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn erofs_layers_not_declared_by_default() {
+        // The default must stay inert: an existing deployment that has not opted into
+        // erofs layer verification must generate exactly the policy it did before.
+        let mut storages = Vec::new();
+        get_erofs_layer_storages(&mut storages, IMAGE_LAYER_VERIFICATION_NONE, &layers_with_hashes(4));
+        assert!(storages.is_empty());
+
+        let mut storages = Vec::new();
+        get_erofs_layer_storages(&mut storages, "something-else", &layers_with_hashes(4));
+        assert!(storages.is_empty());
+    }
+
+    #[test]
+    fn erofs_layers_declared_one_per_image_layer() {
+        let layers = layers_with_hashes(3);
+        let mut storages = Vec::new();
+        get_erofs_layer_storages(&mut storages, IMAGE_LAYER_VERIFICATION_EROFS_DM_VERITY, &layers);
+        assert_eq!(storages.len(), 3);
+
+        for (i, storage) in storages.iter().enumerate() {
+            assert_eq!(storage.driver, super::EROFS_VERITY_LAYER_DRIVER);
+            assert_eq!(storage.fstype, "erofs");
+            assert_eq!(storage.mount_point, "^$(cpath)/$(bundle-id)/rootfs$");
+            assert!(storage.source.is_empty());
+            assert!(storage.driver_options.is_empty());
+
+            // Partition numbers are 1-based and must be distinct, so that the policy
+            // pins the order of the layer stack rather than just its size. They count
+            // the topmost layer first, matching the order the runtime assigns GPT
+            // partitions (containerd's overlayfs lowerdir order), which is the reverse
+            // of the OCI manifest order `image_layers` arrives in.
+            assert!(storage
+                .options
+                .contains(&format!("X-kata.partition-number={}", i + 1)));
+
+            // Every layer must be required to be verity backed. A layer declared
+            // without this is a layer the guest would mount unverified.
+            assert!(storage
+                .options
+                .contains(&"X-kata.dmverity-enabled=true".to_string()));
+
+            // RM-42: the layer's derived root hash is declared, so the mounted bytes
+            // are bound to this specific layer rather than to "some verity device".
+            // Paired with the reversed numbering above: partition 1 carries the last
+            // manifest layer's hash.
+            assert!(storage.options.contains(&format!(
+                "X-kata.dmverity.roothash={}",
+                layers[layers.len() - 1 - i].verity_hash
+            )));
+        }
+    }
+
+    /// The partition a layer is declared under must be the one the runtime will present
+    /// it on. `image_layers` is OCI manifest order (base first), while the runtime
+    /// numbers partitions in containerd's overlayfs lowerdir order (topmost first), so
+    /// the declaration counts backwards. Numbering the same direction as the manifest
+    /// made every multi-layer image unsatisfiable even though its root hashes were
+    /// correct, which reads like a verity mismatch and is not.
+    #[test]
+    fn erofs_layer_partitions_are_numbered_topmost_first() {
+        let layers = layers_with_hashes(3);
+        let mut storages = Vec::new();
+        get_erofs_layer_storages(&mut storages, IMAGE_LAYER_VERIFICATION_EROFS_DM_VERITY, &layers);
+
+        let partition_of = |hash: &str| -> String {
+            let s = storages
+                .iter()
+                .find(|s| s.options.contains(&format!("X-kata.dmverity.roothash={hash}")))
+                .expect("every layer hash must be declared");
+            s.options
+                .iter()
+                .find(|o| o.starts_with("X-kata.partition-number="))
+                .expect("every declaration carries a partition number")
+                .clone()
+        };
+
+        assert_eq!(
+            partition_of(&layers[2].verity_hash),
+            "X-kata.partition-number=1"
+        );
+        assert_eq!(
+            partition_of(&layers[1].verity_hash),
+            "X-kata.partition-number=2"
+        );
+        assert_eq!(
+            partition_of(&layers[0].verity_hash),
+            "X-kata.partition-number=3"
+        );
+    }
+
+    /// Each layer must carry its own hash. Emitting a shared or copied value would
+    /// let one layer of an image be substituted for another.
+    #[test]
+    fn erofs_layers_declare_distinct_root_hashes() {
+        let mut storages = Vec::new();
+        get_erofs_layer_storages(
+            &mut storages,
+            IMAGE_LAYER_VERIFICATION_EROFS_DM_VERITY,
+            &layers_with_hashes(4),
+        );
+        let hashes: std::collections::BTreeSet<&String> = storages
+            .iter()
+            .map(|s| {
+                s.options
+                    .iter()
+                    .find(|o| o.starts_with("X-kata.dmverity.roothash="))
+                    .expect("every layer declares a root hash")
+            })
+            .collect();
+        assert_eq!(hashes.len(), 4);
+    }
+
+    /// A layer with no derived hash must abort generation rather than fall back to
+    /// the weaker "some dm-verity device" declaration. Silently degrading here would
+    /// reintroduce the exact gap RM-42 closes, and it would do so invisibly: the
+    /// policy would still look like it verified the layers.
+    #[test]
+    #[should_panic(expected = "no derived dm-verity root hash")]
+    fn erofs_layers_refuse_to_declare_underived_layers() {
+        let mut storages = Vec::new();
+        get_erofs_layer_storages(
+            &mut storages,
+            IMAGE_LAYER_VERIFICATION_EROFS_DM_VERITY,
+            &layers_without_hashes(2),
+        );
+    }
+
+    #[test]
+    fn erofs_single_layer_image_declares_one_storage() {
+        let mut storages = Vec::new();
+        get_erofs_layer_storages(
+            &mut storages,
+            IMAGE_LAYER_VERIFICATION_EROFS_DM_VERITY,
+            &layers_with_hashes(1),
+        );
+        assert_eq!(storages.len(), 1);
+        assert!(storages[0]
+            .options
+            .contains(&"X-kata.partition-number=1".to_string()));
+    }
+
+    #[test]
+    fn normalizes_bare_docker_hub_names() {
+        assert_eq!(
+            normalize_image_reference("busybox"),
+            "docker.io/library/busybox:latest"
+        );
+        assert_eq!(
+            normalize_image_reference("busybox:latest"),
+            "docker.io/library/busybox:latest"
+        );
+        assert_eq!(
+            normalize_image_reference("redis:7"),
+            "docker.io/library/redis:7"
+        );
+    }
+
+    #[test]
+    fn normalizes_namespaced_docker_hub_names() {
+        assert_eq!(
+            normalize_image_reference("bitnami/nginx:1.25"),
+            "docker.io/bitnami/nginx:1.25"
+        );
+    }
+
+    #[test]
+    fn leaves_fully_qualified_references_alone() {
+        for image in [
+            "quay.io/prometheus/busybox:latest",
+            "ghcr.io/burgerdev/weird-images/gid:latest",
+            "registry.k8s.io/pause:3.9",
+            "myregistry:5000/app:1",
+        ] {
+            assert_eq!(normalize_image_reference(image), image);
+        }
+    }
+
+    #[test]
+    fn preserves_digests() {
+        let pinned = "ghcr.io/burgerdev/weird-images/gid:latest@sha256:bdbb485bb9e3baf381a2957b9369b6051c6113097a5f8dcee27faff17624a2c0";
+        assert_eq!(normalize_image_reference(pinned), pinned);
+        assert_eq!(
+            normalize_image_reference("busybox@sha256:bdbb485bb9e3baf381a2957b9369b6051c6113097a5f8dcee27faff17624a2c0"),
+            "docker.io/library/busybox@sha256:bdbb485bb9e3baf381a2957b9369b6051c6113097a5f8dcee27faff17624a2c0"
+        );
+    }
+
+    #[test]
+    fn falls_back_to_the_verbatim_reference_when_parsing_fails() {
+        assert_eq!(normalize_image_reference("NOT A REFERENCE"), "NOT A REFERENCE:latest");
+    }
 }

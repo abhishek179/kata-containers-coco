@@ -34,7 +34,7 @@ default MemHotplugByProbeRequest := false
 default OnlineCPUMemRequest := true
 default PauseContainerRequest := false
 default ReadStreamRequest := false
-default RemoveContainerRequest := true
+default RemoveContainerRequest := false
 default RemoveStaleVirtiofsShareMountsRequest := true
 default ReseedRandomDevRequest := false
 default ResizeVolumeRequest := false
@@ -42,19 +42,47 @@ default ResumeContainerRequest := false
 default SetGuestDateTimeRequest := false
 default SetIPTablesRequest := false
 default SetPolicyRequest := false
-default SignalProcessRequest := true
-default StartContainerRequest := true
+default SignalProcessRequest := false
+default StartContainerRequest := false
 default StartTracingRequest := false
-default StatsContainerRequest := true
+default StatsContainerRequest := false
 default StopTracingRequest := false
-default TtyWinResizeRequest := true
+default TtyWinResizeRequest := false
 default UpdateContainerRequest := false
 default UpdateEphemeralMountsRequest := false
 default UpdateInterfaceRequest := false
 default UpdateRoutesRequest := false
 default VolumeStatsRequest := false
-default WaitProcessRequest := true
+default WaitProcessRequest := false
 default WriteStreamRequest := false
+
+# Intentionally-allowed infrastructure / sandbox-lifecycle endpoints (reviewed, not an
+# unexamined gap). The endpoints below keep `:= true` above by design: they are part of
+# the trusted, host-driven sandbox lifecycle and carry no attacker-constrainable,
+# security-relevant payload that an in-guest Rego gate could restrict without breaking
+# legitimate VM sizing, boot, or teardown.
+#
+#   DestroySandboxRequest                  empty payload; sandbox teardown. The host
+#                                          already controls the VM lifecycle (it can
+#                                          destroy the VM directly), so gating adds no
+#                                          guarantee.
+#   GetOOMEventRequest                     empty payload; read-only OOM notification
+#                                          stream polled by the runtime.
+#   GuestDetailsRequest                    read-only guest capability query (memory block
+#                                          size / hotplug probe) issued early in the boot
+#                                          handshake, before any container state exists.
+#   OnlineCPUMemRequest                    host-driven online of CPU/memory the host
+#                                          itself provisions; onlining host-provided
+#                                          hardware is not an in-guest trust boundary and
+#                                          the count is fixed by VM config, not the guest.
+#   RemoveStaleVirtiofsShareMountsRequest  empty payload; housekeeping of stale virtiofs
+#                                          shares the host already controls.
+#
+# This matches the reference, which likewise does not gate its GuestDetails/OOM/lifecycle
+# equivalents; the diagnostics surface the reference *does* gate (get-properties /
+# dump-stacks) is instead hard-disabled in the strict build (GetDiagnosticDataRequest and
+# CopyFileRequest are `:= false` above). Per-container operations (Create/Exec/Signal/
+# Start/Wait/Stats/TtyWinResize/RemoveContainer) ARE gated on authorized container state (see below).
 
 # AllowRequestsFailingPolicy := true configures the Agent to *allow any
 # requests causing a policy failure*. This is an unsecure configuration
@@ -73,6 +101,17 @@ CreateContainerRequest := {"ops": ops, "allowed": true} if {
     # policy_data.containers information.
     allow_create_container_input
 
+    # RM-20: a container id is consumed for the sandbox's lifetime. RemoveContainerRequest
+    # deletes the id's own state key (so no stale id -> container reference survives) but
+    # records a separate tombstone, and a create for a tombstoned id is refused here.
+    # Without this the same host-chosen id could name a second container, which is the
+    # property the baseline relies on to make an untrusted id harmless: hcsshim's
+    # create_container requires `not container_started` and never clears that mark, not
+    # even in shutdown_container. get_state_val is undefined for an absent key, and `not`
+    # over an undefined expression succeeds, so this admits every first create.
+    not get_state_val(retired_key(input.container_id))
+    print("CreateContainerRequest: container id", input.container_id, "has not been used before")
+
     i_oci := input.OCI
     i_storages := input.storages
     i_devices := input.devices
@@ -85,8 +124,10 @@ CreateContainerRequest := {"ops": ops, "allowed": true} if {
     add_sandbox_name_to_state := state_allows("sandbox_name", sandbox_name)
     ops_builder1 := concat_op_if_not_null(ops_builder, add_sandbox_name_to_state)
 
-    # Check if any element from the policy_data.containers array allows the input request.
-    some idx, p_container in policy_data.containers
+    # Check if any element from the allowed-container set (base + composed fragment
+    # containers) allows the input request.
+    some entry in all_policy_container_entries
+    p_container := entry.container
     print("======== CreateContainerRequest: trying next policy container")
 
     p_pidns := p_container.sandbox_pidns
@@ -122,9 +163,11 @@ CreateContainerRequest := {"ops": ops, "allowed": true} if {
 
     # save to policy state
     # key: input.container_id
-    # val: index of p_container in the policy_data.containers array
+    # val: a stable reference to the policy container that authorized it. NOT its index
+    #      in the combined set: that set grows as fragments load, so an index recorded
+    #      now can name a different container later (see all_policy_container_entries).
     print("CreateContainerRequest: adding container_id=", input.container_id, " to state")
-    add_p_container_to_state := state_allows(input.container_id, idx)
+    add_p_container_to_state := state_allows(input.container_id, entry.ref)
 
     ops := concat_op_if_not_null(ret.ops, add_p_container_to_state)
 
@@ -222,6 +265,13 @@ get_state_val(key) = value if {
 get_state_path(key) = path if {
     # prepend "/pstate/" to key
     path := concat("/", ["/pstate", key])
+}
+
+# RM-20: state key under which a removed container id is tombstoned. Namespaced so it can
+# never collide with a container id's own key -- a container id is hex, so it cannot start
+# with "retired:".
+retired_key(container_id) = key if {
+    key := concat("", ["retired:", container_id])
 }
 
 # Helper functions to conditionally concatenate op is not null
@@ -817,7 +867,7 @@ allow_by_bundle_or_sandbox_id(p_oci, i_oci, p_storages, i_storages) if {
     print("allow_by_bundle_or_sandbox_id: p_matches =", p_matches)
     count(p_matches) == count(i_oci.Mounts)
 
-    allow_storages(p_storages, i_storages, bundle_id, sandbox_id)
+    allow_storages(p_storages, i_storages, bundle_id, sandbox_id, p_oci)
 
     print("allow_by_bundle_or_sandbox_id: true")
 }
@@ -844,8 +894,51 @@ allow_process(p_process, i_process, s_name, s_namespace) if {
     allow_process_common(p_process, i_process, s_name, s_namespace)
     allow_caps(p_process.Capabilities, i_process.Capabilities)
     p_process.Terminal == i_process.Terminal
+    allow_process_fields_fr16(p_process, i_process)
 
     print("allow_process: true")
+}
+
+# Enforce OCI Process security fields that the host forwards from the CRI/kubelet
+# but that were previously left unconstrained by the policy: ApparmorProfile and
+# Rlimits.
+#
+# - Rlimits are exact-matched (as a set) against the policy-modeled value
+#   (defaulting to empty), so a compromised host cannot silently relax them.
+# - ApparmorProfile is exact-matched only when the policy models an expected
+#   value (i.e. the pod spec pins a Localhost/Unconfined profile, or an operator
+#   configures a cluster default). When unmodeled the field is absent from the
+#   policy and left unconstrained, because the profile emitted for the
+#   RuntimeDefault case depends on host apparmor state, which is not derivable
+#   from the pod spec.
+#
+# OOMScoreAdj is intentionally not enforced here: kubelet computes it from the
+# pod QoS class and node memory, so its value is environment-derived and not
+# predictable at policy-generation time; it only influences OOM-kill ordering
+# and is not a container-sandbox integrity boundary.
+allow_process_fields_fr16(p_process, i_process) if {
+    p_rlimits := {r | some r in object.get(p_process, "Rlimits", [])}
+    i_rlimits := {r | some r in object.get(i_process, "Rlimits", [])}
+    print("allow_process_fields_fr16: policy rlimits =", p_rlimits, "input rlimits =", i_rlimits)
+    p_rlimits == i_rlimits
+
+    allow_apparmor_profile(p_process, i_process)
+
+    print("allow_process_fields_fr16: true")
+}
+
+# No expected apparmor profile modeled -> unconstrained.
+allow_apparmor_profile(p_process, _) if {
+    not p_process.ApparmorProfile
+    print("allow_apparmor_profile: not modeled, allow")
+}
+
+# Expected apparmor profile modeled -> exact match against the input.
+allow_apparmor_profile(p_process, i_process) if {
+    p_apparmor := p_process.ApparmorProfile
+    i_apparmor := object.get(i_process, "ApparmorProfile", "")
+    print("allow_apparmor_profile: policy =", p_apparmor, "input =", i_apparmor)
+    p_apparmor == i_apparmor
 }
 
 # Compare the OCI Process field of a policy container with the input process field from ExecProcessRequest
@@ -1227,7 +1320,7 @@ mount_source_allows(p_mount, i_mount, bundle_id, sandbox_id) if {
 ######################################################################
 # Create container Storages
 
-allow_storages(p_storages, i_storages, bundle_id, sandbox_id) if {
+allow_storages(p_storages, i_storages, bundle_id, sandbox_id, p_oci) if {
     print("allow_storages: p_storages =", p_storages)
     print("allow_storages: i_storages =", i_storages)
 
@@ -1238,56 +1331,363 @@ allow_storages(p_storages, i_storages, bundle_id, sandbox_id) if {
 
     p_count == i_count - img_pull_count
 
+    # FR-4A: the presented storages must be a *bijection* of the declared ones, not
+    # merely an equal-sized set in which every presented storage happens to match some
+    # declaration. Count equality plus an existential match alone accepts a request that
+    # presents one declared storage twice while never presenting another: the counts
+    # still balance and both duplicates satisfy the same declaration. The two checks
+    # below close that, in both directions.
+    #
+    # 1. No presented storage may repeat another's identity.
+    #
+    # RM-41: [driver, source, mount_point] alone is not an identity for EROFS image
+    # layers. runtime-rs attaches *one* block device spanning every layer's GPT
+    # partition and clones it per partition, so all N of a container's lower layers
+    # present the same driver, the same guest device path and the same mount point;
+    # only the partition number and the dm-verity parameters differ. Without a
+    # discriminator this check would reject every multi-layer image outright, and were
+    # the count check ever relaxed it would also stop distinguishing "N distinct layers"
+    # from "the same layer N times". The root hash is the natural discriminator: it is
+    # what makes one layer a different layer from another.
+    storage_identities := {storage_identity(s) | some s in i_storages}
+    print("allow_storages: distinct identities =", count(storage_identities))
+    count(storage_identities) == i_count
+
+    # 2. Every presented storage is covered by a declaration (as before) ...
     every i_storage in i_storages {
-        allow_storage(p_storages, i_storage, bundle_id, sandbox_id)
+        allow_storage(p_storages, i_storage, bundle_id, sandbox_id, p_oci)
+    }
+
+    # ... and every declaration is covered by a presented storage, so no declared
+    # storage can be silently dropped in favour of a duplicate of another.
+    every p_storage in p_storages {
+        storage_is_presented(p_storage, i_storages, bundle_id, sandbox_id)
     }
 
     print("allow_storages: true")
 }
 
-allow_storage(p_storages, i_storage, bundle_id, sandbox_id) if {
+# FR-4A: the reverse direction of allow_storage — is this *declaration* satisfied by
+# some presented storage? Together with the count check and the duplicate rejection in
+# allow_storages this makes the declared/presented relation a bijection.
+storage_is_presented(p_storage, i_storages, bundle_id, sandbox_id) if {
+    some i_storage in i_storages
+    storage_pair_matches(p_storage, i_storage, bundle_id, sandbox_id)
+    print("storage_is_presented: true for", p_storage)
+}
+
+allow_storage(p_storages, i_storage, bundle_id, sandbox_id, p_oci) if {
     some p_storage in p_storages
 
     print("allow_storage: p_storage =", p_storage)
     print("allow_storage: i_storage =", i_storage)
 
-    p_storage.driver == i_storage.driver
-    allow_storage_source(p_storage, i_storage, bundle_id)
-
-    allow_storage_base(p_storage, i_storage, bundle_id, sandbox_id)
+    storage_pair_matches(p_storage, i_storage, bundle_id, sandbox_id)
 
     print("allow_storage: true")
 }
-allow_storage(p_storages, i_storage, bundle_id, sandbox_id) if {
+
+# Pairwise storage match: does this single declaration admit this single presented
+# storage? Factored out of allow_storage so that the same relation can be evaluated in
+# the declaration -> presented direction by storage_is_presented. The three bodies below
+# mirror the three p_storage-consuming allow_storage variants exactly.
+storage_pair_matches(p_storage, i_storage, bundle_id, sandbox_id) if {
+    p_storage.driver == i_storage.driver
+    allow_storage_source(p_storage, i_storage, bundle_id)
+    allow_storage_base(p_storage, i_storage, bundle_id, sandbox_id)
+}
+storage_pair_matches(p_storage, i_storage, bundle_id, sandbox_id) if {
+    i_storage.driver == "scsi"
+    regex.match("^[0-9]+:[0-9]+$", i_storage.source)
+    allow_host_chosen_device(p_storage)
+    allow_storage_base(p_storage, i_storage, bundle_id, sandbox_id)
+}
+storage_pair_matches(p_storage, i_storage, bundle_id, sandbox_id) if {
+    i_storage.driver == "blk"
+    regex.match("^[0-9a-f]{2}(/[0-9a-f]{2})?$", i_storage.source)
+    allow_host_chosen_device(p_storage)
+    allow_storage_base(p_storage, i_storage, bundle_id, sandbox_id)
+}
+
+# RM-38: a dm-verity backed EROFS image layer.
+#
+# In unmerged mode each image layer is its own erofs image, presented as one GPT
+# partition of a single block device. Neither the block driver nor the guest device path
+# is predictable at policy generation time, so — as with the host-chosen emptyDir
+# devices above — the declaration cannot name them and instead carries the marker driver
+# "erofs-verity-layer". This body then checks everything that *is* predictable and
+# constrains the shape of the rest.
+#
+# The security-relevant part is the option handling. Every declared option must be
+# present, and every *extra* presented option must be one of the dm-verity parameters
+# whose value is assigned at runtime. That inverted check is what makes the rule safe:
+# it means a host cannot bolt an unrecognised X-kata option (say, one that disables
+# verification, or an overlay-upper marker) onto a layer that the policy believes is a
+# read-only verity-protected lower layer.
+storage_pair_matches(p_storage, i_storage, bundle_id, sandbox_id) if {
+    print("storage_pair_matches erofs: start")
+
+    p_storage.driver == "erofs-verity-layer"
+
+    # Presented as a block device whose id the host chose.
+    i_storage.driver in erofs_block_drivers
+
+    p_storage.driver_options == i_storage.driver_options
+    p_storage.fs_group == i_storage.fs_group
+
+    # protobuf omits false booleans from some JSON encodings, so read defensively.
+    object.get(i_storage, "shared", false) == false
+    object.get(p_storage, "shared", false) == false
+
+    p_storage.fstype == i_storage.fstype
+    p_storage.fstype == "erofs"
+
+    allow_erofs_layer_mount_point(p_storage, i_storage, bundle_id)
+    allow_erofs_verity_options(p_storage, i_storage)
+
+    print("storage_pair_matches erofs: true")
+}
+
+# The layer mounts under the container's own bundle directory. Pinning it here is what
+# stops a layer from being redirected at another container's rootfs, or at a sandbox
+# path: bundle_id is taken from the request being evaluated, not from the storage.
+allow_erofs_layer_mount_point(p_storage, i_storage, bundle_id) if {
+    mount1 := p_storage.mount_point
+    mount2 := replace(mount1, "$(cpath)", policy_data.common.cpath)
+    mount3 := replace(mount2, "$(bundle-id)", bundle_id)
+
+    print("allow_erofs_layer_mount_point: regex =", mount3)
+    regex.match(mount3, i_storage.mount_point)
+}
+
+erofs_block_drivers := {"blk", "scsi", "mmioblk", "nvdimm", "local"}
+
+allow_erofs_verity_options(p_storage, i_storage) if {
+    print("allow_erofs_verity_options: p_options =", p_storage.options)
+    print("allow_erofs_verity_options: i_options =", i_storage.options)
+
+    # No option may be repeated: a set built from the presented options would otherwise
+    # let a duplicate stand in for a required distinct one.
+    count({o | some o in i_storage.options}) == count(i_storage.options)
+
+    # Every declared option is present, verbatim.
+    every p_option in p_storage.options {
+        p_option in i_storage.options
+    }
+
+    # The layer must actually be verity backed. This is redundant with the declaration
+    # (genpolicy always emits it) but is stated here so the rule remains correct if a
+    # declaration is ever hand-edited.
+    "X-kata.dmverity-enabled=true" in i_storage.options
+
+    # Exactly one root hash must be present among the runtime-assigned options.
+    #
+    # "At least one" is not enough: the duplicate check above only rejects options that
+    # are byte-identical, so a storage could carry both the declared root hash and a
+    # second, different one. Which of the two the guest would act on is an
+    # implementation detail of option parsing, and relying on it would be a way to
+    # smuggle an undeclared hash past a policy that looks like it pinned one.
+    #
+    # The declaration carries `X-kata.dmverity.roothash=<hash>` (RM-42, derived by
+    # rebuilding the layer's erofs image with containerd's own mkfs.erofs invocation),
+    # the "every declared option is present" check above binds that exact value, and
+    # this count makes it the only one — so the mounted layer is bound to the image the
+    # policy was generated for.
+    count([o | some o in i_storage.options; startswith(o, "X-kata.dmverity.roothash=")]) == 1
+
+    # The *declaration* must pin a root hash too (RM-51). Without this, a declaration
+    # that simply omitted the hash would still satisfy every check above: the presented
+    # layer would be required to be verity backed and to carry exactly one root hash,
+    # but that hash would be whatever the host chose. That used to be acceptable because
+    # the guest cross-checked it against the measured initdata allowlist
+    # (verified-layers.toml); that store is gone, so the policy is now the only thing
+    # that says which content a layer may have, and it has to actually say it.
+    # genpolicy always emits the hash and fails closed when it cannot derive one
+    # (RM-47), so this only rejects a hand-edited or stale declaration.
+    count([o | some o in p_storage.options; startswith(o, "X-kata.dmverity.roothash=")]) == 1
+
+    # Anything the declaration did not ask for must be a runtime-assigned dm-verity
+    # parameter of the expected shape.
+    every i_option in i_storage.options {
+        allow_erofs_extra_option(p_storage, i_option)
+    }
+
+    print("allow_erofs_verity_options: true")
+}
+
+allow_erofs_extra_option(p_storage, i_option) if {
+    i_option in p_storage.options
+}
+allow_erofs_extra_option(_, i_option) if {
+    erofs_verity_dynamic_option(i_option)
+}
+
+erofs_verity_dynamic_option(o) if regex.match("^X-kata\\.dmverity\\.roothash=[0-9a-f]{64}$", o)
+erofs_verity_dynamic_option(o) if regex.match("^X-kata\\.dmverity\\.hashoffset=[0-9]+$", o)
+erofs_verity_dynamic_option(o) if regex.match("^X-kata\\.dmverity\\.no-superblock=(true|false)$", o)
+erofs_verity_dynamic_option(o) if regex.match("^X-kata\\.dmverity\\.salt=[0-9a-f]{2,128}$", o)
+
+# RM-41: identity of a presented storage, for the duplicate check in allow_storages.
+# The dm-verity root hash is appended so that the N lower layers of a multi-layer image
+# — which necessarily share driver, source and mount point — are distinguished from one
+# another. concat over a sorted array is total: it yields "" for the storages that carry
+# no root hash, leaving their identity exactly as it was before.
+storage_identity(s) := [s.driver, s.source, s.mount_point, verity_discriminator(s)]
+
+verity_discriminator(s) := concat(",", sort([o |
+    some o in object.get(s, "options", [])
+    startswith(o, "X-kata.dmverity.roothash=")
+]))
+
+# RM-35: restrict the blk/scsi bodies above to declarations that actually opted into
+# host-chosen block backing.
+#
+# Those two bodies exist because a device id -- a SCSI address or a PCI path -- is
+# assigned at runtime and cannot be predicted when the policy is generated, so they
+# key on the *presented* driver and check only the shape of the presented source.
+# That is unavoidable for the source. What was avoidable is that they said nothing
+# about p_storage: any declaration at all could be satisfied by a presented block
+# device, including declarations written for `ephemeral`, `local` or `overlayfs`
+# storage, whose author never contemplated a host-attached disk appearing in their
+# place.
+#
+# Only two declarations are meant to be backed by a host-chosen device --
+# emptyDir_encrypted and emptyDir_plain -- and both mark themselves the same way:
+# an empty driver and an empty source (the generator cannot fill either), and a
+# mount point derived from the device id rather than fixed. Requiring that marking
+# turns "any declaration" into "a declaration that asked for this", which is the
+# part of the binding that can be established at generation time.
+#
+# What this deliberately does NOT do is pin *which* device is presented. That is
+# hcsshim's data.metadata.devices[path] property. Note the blocker is NOT that this
+# policy lacks state -- it has some: `pstate` (see state_allows above) already records
+# container_id -> authorizing policy container, the direct analogue of hcsshim's
+# data.metadata.matches. The blocker is that hcsshim can record a device's identity
+# because its *guest* produces one: it reads the dm-verity superblock off the device
+# on every read-only mount and refuses the mount if it cannot. Kata's agent never
+# measures a block device, so there is nothing trustworthy to record -- the only hash
+# it ever sees arrives in host-supplied storage.options. Closing this therefore needs
+# RM-31 (measure in the guest) and RM-34 (a declaration to compare against) first;
+# state is already available. Tracked as RM-35's open half. The exact `options` and
+# `driver_options` equality in allow_storage_base, the bijection in allow_storages,
+# and `create_filesystem` on both surviving declarations (the agent formats the
+# device, destroying whatever content the host put there) are what stand in the
+# meantime.
+allow_host_chosen_device(p_storage) if {
+    print("allow_host_chosen_device: start")
+
+    p_storage.driver == ""
+    p_storage.source == ""
+    contains(p_storage.mount_point, "$(b64_device_id)")
+
+    print("allow_host_chosen_device: true")
+}
+allow_storage(p_storages, i_storage, bundle_id, sandbox_id, p_oci) if {
     i_storage.driver == "image_guest_pull"
     print("allow_storage with image_guest_pull: start")
     i_storage.fstype == "overlay"
     i_storage.fs_group == null
     i_storage.shared == false
     count(i_storage.options) == 0
-    # TODO: Check Mount Point, Source, Driver Options, etc.
+
+    # RM-29: bind the pulled image to *this* container's declaration, and bind the
+    # bundle it unpacks into to *this* container's id.
+    #
+    # This storage carries the container root filesystem, and it has no p_storage:
+    # genpolicy emits no declaration for it, which is why it is subtracted from the
+    # cardinality check above and why this body used to check nothing but shape. The
+    # effect was that `source` -- the image reference -- and `mount_point` were entirely
+    # host-chosen. Since the *process* spec is checked against this container's
+    # declaration and the *root filesystem* was checked against nothing, the policy
+    # authorized a set of images and a set of process specs and permitted any pairing
+    # between them rather than the declared pairings.
+    #
+    # The declaration does name the image, in an annotation genpolicy fills from the pod
+    # spec (policy.rs, "io.kubernetes.cri.image-name"), and the runtime builds `source`
+    # from the same annotation (virtual_volume.rs::get_image_reference). Comparing the
+    # presented source against the *declared* value -- not against the input annotation,
+    # which is host-supplied and unconstrained -- is what binds code to container. It is
+    # the property hcsshim gets from data.metadata.matches[input.containerID].
+    #
+    # Two guest-pull storages naming *different* images are refused here; two naming the
+    # *same* image are refused by the distinct-identities check in allow_storages, since
+    # the mount point is pinned below and their identities therefore coincide. So the
+    # cardinality exemption can no longer admit a second root filesystem.
+    allow_image_guest_pull_source(p_oci, i_storage)
+
+    # The agent derives the unpack directory from the container id and ignores
+    # mount_point entirely, so this is defence in depth rather than the load-bearing
+    # check -- but a storage naming another container's bundle has no honest reason to
+    # exist, and leaving it unconstrained is what let probe B pass.
+    p_mount_point := replace(policy_data.common.root_path, "$(bundle-id)", bundle_id)
+    print("allow_storage with image_guest_pull: p_mount_point =", p_mount_point, "i_mount_point =", i_storage.mount_point)
+    i_storage.mount_point == p_mount_point
+
     print("allow_storage with image_guest_pull: true")
 }
-allow_storage(p_storages, i_storage, bundle_id, sandbox_id) if {
-    print("allow_storage with scsi: start")
 
-    i_storage.driver == "scsi"
-    regex.match("^[0-9]+:[0-9]+$", i_storage.source)
-
-    allow_block_storage(p_storages, i_storage, bundle_id, sandbox_id)
-
-    print("allow_storage with scsi: true")
+# The image reference this container's declaration names. Digest-pinned references are
+# compared by digest rather than by string, because the two sides spell the same image
+# differently: genpolicy records the canonical reference from the registry
+# (`ghcr.io/x/gid:latest@sha256:bdbb...`) while the runtime passes through the reference
+# from the pod spec (`ghcr.io/x/gid@sha256:bdbb...`). Requiring string equality would
+# deny every legitimate guest pull. The digest is also the *right* thing to compare: it
+# is what pins content, and two references sharing a digest name the same bytes whatever
+# the registry path says.
+#
+# RM-51: whether an unpinned reference is admitted at all is controlled by
+# `require_pinned_image_digests`. Guest pull unpacks into the guest's own filesystem, so
+# there is no read-only block device and no dm-verity root hash to bind — the manifest
+# digest is the *only* thing that identifies the content, and pinning it transitively pins
+# every layer digest the manifest lists. A tag names whatever the host decides to serve.
+# The guest used to catch that separately, in VerifiedImageStore::authorize
+# (ImageError::UnpinnedImage); that store is gone, so the requirement lives here now.
+allow_image_guest_pull_source(p_oci, i_storage) if {
+    p_image := p_oci.Annotations["io.kubernetes.cri.image-name"]
+    p_digest := image_pinned_digest(p_image)
+    i_digest := image_pinned_digest(i_storage.source)
+    print("allow_image_guest_pull_source 1: p_digest =", p_digest, "i_digest =", i_digest)
+    p_digest == i_digest
+    print("allow_image_guest_pull_source 1: true")
 }
-allow_storage(p_storages, i_storage, bundle_id, sandbox_id) if {
-    print("allow_storage with blk: start")
-
-    i_storage.driver == "blk"
-    regex.match("^[0-9a-f]{2}(/[0-9a-f]{2})?$", i_storage.source)
-
-    allow_block_storage(p_storages, i_storage, bundle_id, sandbox_id)
-
-    print("allow_storage with blk: true")
+# An unpinned reference is admitted only where pinning is not required. Strict
+# deployments set `require_pinned_image_digests` and get no such body, so an unpinned
+# reference has no matching rule and is denied. Where pinning is not required this is
+# still no weaker than the tag the tenant wrote.
+allow_image_guest_pull_source(p_oci, i_storage) if {
+    not policy_data.common.require_pinned_image_digests
+    p_image := p_oci.Annotations["io.kubernetes.cri.image-name"]
+    not contains(p_image, "@")
+    print("allow_image_guest_pull_source 2: unpinned p_image =", p_image, "i_source =", i_storage.source)
+    i_storage.source == p_image
+    print("allow_image_guest_pull_source 2: true")
 }
+# The pause container is the one case with no declared image: genpolicy deliberately
+# omits the annotation for it (policy.rs, `if !is_pause_container`), and the runtime
+# names its rootfs with the literal "pause" -- get_image_reference returns that for
+# ContainerType::PodSandbox -- because the pause image ships inside the measured guest
+# rootfs and is never pulled. Admitting the sentinel only for a declaration that is
+# *both* image-less and typed "sandbox" keeps the pause path from becoming a wildcard
+# that any container could claim.
+allow_image_guest_pull_source(p_oci, i_storage) if {
+    not p_oci.Annotations["io.kubernetes.cri.image-name"]
+    p_oci.Annotations["io.kubernetes.cri.container-type"] == "sandbox"
+    print("allow_image_guest_pull_source 3: sandbox container, i_source =", i_storage.source)
+    i_storage.source == "pause"
+    print("allow_image_guest_pull_source 3: true")
+}
+
+# The `algorithm:hex` digest pinned in an OCI reference of the form `name@algorithm:hex`.
+# Undefined when the reference is not pinned, which is what makes the two bodies above
+# mutually exclusive rather than overlapping.
+image_pinned_digest(image_ref) := digest if {
+    contains(image_ref, "@")
+    parts := split(image_ref, "@")
+    digest := lower(parts[count(parts) - 1])
+}
+# NOTE: the former scsi/blk allow_storage variants are now expressed as bodies of
+# storage_pair_matches above, so the generic p_storage-consuming allow_storage variant
+# covers them. allow_block_storage became dead with them and has been removed.
 
 # Validates all storage fields except driver and source.
 allow_storage_base(p_storage, i_storage, bundle_id, sandbox_id) if {
@@ -1300,16 +1700,6 @@ allow_storage_base(p_storage, i_storage, bundle_id, sandbox_id) if {
 
     allow_mount_point(p_storage, i_storage, bundle_id, sandbox_id)
     allow_storage_options(p_storage, i_storage)
-}
-
-allow_block_storage(p_storages, i_storage, bundle_id, sandbox_id) if {
-    print("allow_block_storage: start")
-
-    some p_storage in p_storages
-
-    allow_storage_base(p_storage, i_storage, bundle_id, sandbox_id)
-
-    print("allow_block_storage: true")
 }
 
 allow_storage_source(p_storage, i_storage, bundle_id) if {
@@ -1535,10 +1925,31 @@ allow_sandbox_storages(i_storages) if {
     print("allow_sandbox_storages: i_storages =", i_storages)
 
     p_storages := policy_data.sandbox.storages
+
+    # RM-30: the repetition half of the bijection allow_storages received in 1b335c0e2,
+    # which stopped short of this rule. The body below was purely existential -- every
+    # presented storage had to match *some* declaration, with no distinctness check --
+    # so the host could present one declared storage several times.
+    #
+    # Injection was already bounded, because allow_sandbox_storage demands exact
+    # equality against a declared entry, and exact equality also makes distinctness
+    # cheap to state: no two presented storages may be the same object.
+    i_set := {s | some s in i_storages}
+    print("allow_sandbox_storages: distinct =", count(i_set), "presented =", count(i_storages))
+    count(i_set) == count(i_storages)
+
     every i_storage in i_storages {
         allow_sandbox_storage(p_storages, i_storage)
     }
 
+    # NOTE: the *omission* half is deliberately not closed here, and this is the reason.
+    # The presented list is legitimately a strict subset of the declared one -- the
+    # genpolicy test corpus contains a sandbox that declares an ephemeral `shm` tmpfs
+    # and presents no storages at all -- so a cardinality or reverse-coverage check of
+    # the kind allow_storages uses denies ordinary pods. Closing omission needs genpolicy
+    # to record which sandbox storages are *required* rather than merely permitted, which
+    # is a policy-format change; until then a dropped sandbox mount is indistinguishable
+    # from a pod that never needed it. Tracked as the residual of RM-30.
     print("allow_sandbox_storages: true")
 }
 
@@ -1640,8 +2051,8 @@ allow_interactive_exec(p_container, i_process) if {
 }
 
 get_state_container(container_id):= p_container if {
-    idx := get_state_val(container_id)
-    p_container := policy_data.containers[idx]
+    ref := get_state_val(container_id)
+    p_container := container_by_ref(ref)
 }
 
 ExecProcessRequest if {
@@ -1786,10 +2197,522 @@ GetDiagnosticDataRequest if {
 RemoveContainerRequest:= {"ops": ops, "allowed": true} if {
     print("RemoveContainerRequest: input =", input)
 
-    # Delete input.container_id from p_state
+    # Only a container this policy authorized to run may be removed. get_state_val is
+    # undefined for an unknown or already-removed container_id, which makes this rule
+    # undefined and falls through to the fail-closed default, closing the "remove any
+    # container_id" gap (and making removal idempotent: a second remove is denied).
+    p_container_index := get_state_val(input.container_id)
+    print("RemoveContainerRequest: container", input.container_id, "known at index", p_container_index)
+
+    # Delete input.container_id from p_state, and tombstone the id so it can never name a
+    # second container in this sandbox (RM-20). Deleting is still right -- it is what makes
+    # every later start/exec/signal/remove for the id undefined and therefore denied -- but
+    # on its own it also frees the id for reuse, which the baseline never does.
     ops_builder1 := []
     del_container := state_del_key(input.container_id)
-    ops := concat_op_if_not_null(ops_builder1, del_container)
+    ops_builder2 := concat_op_if_not_null(ops_builder1, del_container)
+    retire_container := state_allows(retired_key(input.container_id), input.container_id)
+    ops := concat_op_if_not_null(ops_builder2, retire_container)
 
     print("RemoveContainerRequest: true")
+}
+
+# RM-26: removing an id this policy never admitted is a successful no-op.
+#
+# The rule above is deliberately undefined for an unknown container_id, and on its own
+# that produced a deadlock during teardown. When a CreateContainerRequest is denied, the
+# shim's cleanup path still issues RemoveContainerRequest for the same id -- but no state
+# key was ever written for it, so the removal was denied too. The shim retried, the
+# kubelet waited, and the pod sat in `Terminating` until someone force-deleted it. Each
+# individual decision was correct; the composition had no exit. That failure mode is
+# worse than it looks: an operator experiences a *correctly enforced* denial as a hung
+# workload, which is exactly the pressure that gets policies loosened.
+#
+# Admitting the no-op gives up nothing. There is no container behind the id, so there is
+# nothing to destroy and no state to delete -- the request cannot have an effect beyond
+# the tombstone written below. What it must NOT do is re-admit the cases the strict rule
+# closes, so it is guarded on *both* keys: an id with live state takes the rule above,
+# and an id that is already tombstoned (a genuine second remove of a container that did
+# run) still falls through to the fail-closed default.
+#
+# The tombstone is written here as well, so removal stays single-shot per id no matter
+# which path admitted it (RM-20). This does let the host burn an id by removing it before
+# creating it, but that is not a new capability: the host chooses the ids and decides
+# whether to send the create at all, so it can only deny itself.
+RemoveContainerRequest := {"ops": ops, "allowed": true} if {
+    print("RemoveContainerRequest: input =", input)
+
+    not get_state_val(input.container_id)
+    not get_state_val(retired_key(input.container_id))
+    print("RemoveContainerRequest: container", input.container_id, "was never admitted; no-op removal")
+
+    ops := concat_op_if_not_null([], state_allows(retired_key(input.container_id), input.container_id))
+
+    print("RemoveContainerRequest: true (no-op)")
+}
+
+# Gate SignalProcessRequest instead of allowing every signal unconditionally.
+# A signal is permitted only when (1) its number is in the policy's sandbox-wide
+# allowed_signals set, (2) it targets a container this policy authorized to run (tracked
+# in persisted state by CreateContainerRequest and cleared by RemoveContainerRequest),
+# and (3) its number is in *that container's own* allowed_signals set.
+#
+# (3) is the hcsshim parity property (F-76): the reference stack stores a per-container
+# `Signals` list on securityPolicyContainer and consults the signalled container's own
+# list, so a signal admitted for one workload is not thereby admitted for every other
+# process in the sandbox. Checking (1) as well as (3) makes the sandbox-wide list a
+# ceiling rather than a second source of truth: a container carried by a policy fragment
+# is resolved through get_state_container -> container_by_ref, which re-runs the fragment
+# declaration gates, and even then it can only ever narrow what the measured base policy
+# admits -- a fragment cannot widen the signal surface.
+SignalProcessRequest if {
+    print("SignalProcessRequest: input =", input)
+
+    # (1) The signal number must be explicitly allowed by the sandbox-wide policy.
+    i_signal := input.signal
+    some allowed_signal in policy_data.request_defaults.SignalProcessRequest.allowed_signals
+    i_signal == allowed_signal
+    print("SignalProcessRequest: signal", i_signal, "is allowed sandbox-wide")
+
+    # (2)+(3) The target container must be known to this policy (present in state), and
+    # the signal must be in that container's own set. get_state_container is undefined for
+    # an unknown/removed container_id -- and p_container.allowed_signals is undefined for a
+    # container entry generated before this field existed -- which makes this rule
+    # undefined and falls through to the fail-closed default.
+    p_container := get_state_container(input.container_id)
+    some container_signal in p_container.allowed_signals
+    i_signal == container_signal
+    print("SignalProcessRequest: signal", i_signal, "is allowed for container", input.container_id)
+
+    print("SignalProcessRequest: true")
+}
+
+# Gate container-scoped lifecycle/inspection endpoints on a known-container check
+# instead of allowing them unconditionally. StartContainerRequest, WaitProcessRequest,
+# StatsContainerRequest and TtyWinResizeRequest each act on a specific container_id and
+# are permitted only for a container this policy authorized to run (recorded in
+# persisted state by CreateContainerRequest and cleared by RemoveContainerRequest).
+# get_state_val is undefined for an unknown or already-removed container_id, which makes
+# the rule undefined and falls through to the fail-closed default. This mirrors the
+# reference behavior of scoping per-container operations to containers the policy
+# actually created, closing the "operate on any container_id" gap of the previous
+# unconditional defaults.
+allow_known_container(container_id) if {
+    p_container_index := get_state_val(container_id)
+    print("allow_known_container: container", container_id, "known at index", p_container_index)
+}
+
+StartContainerRequest if {
+    print("StartContainerRequest: input =", input)
+    allow_known_container(input.container_id)
+    print("StartContainerRequest: true")
+}
+
+WaitProcessRequest if {
+    print("WaitProcessRequest: input =", input)
+    allow_known_container(input.container_id)
+    print("WaitProcessRequest: true")
+}
+
+StatsContainerRequest if {
+    print("StatsContainerRequest: input =", input)
+    allow_known_container(input.container_id)
+    print("StatsContainerRequest: true")
+}
+
+TtyWinResizeRequest if {
+    print("TtyWinResizeRequest: input =", input)
+    allow_known_container(input.container_id)
+    print("TtyWinResizeRequest: true")
+}
+
+# ---- BL-7 (Jiri Feature A): policy fragment composition (issuer + feed + minimum SVN gate) ----
+# Fragments are separate signed modules that the guest agent's Security Reference Monitor
+# verifies (COSE/did:x509 + SVN + feed + ordering/transparency gates) and then applies into
+# the reserved `agent_policy.fragments` namespace (see docs/cc/fr1-fragments.md FR-1c). The
+# base policy declares which fragments it trusts in `policy_data.fragments[]`
+# (issuer/feed/minimum_svn); those declarations are measured into HostData, so composition is
+# attested.
+#
+# Runtime data contract: a verified fragment for feed F contributes, under this namespace, a
+# keyed entry `data.agent_policy.fragments[F] == {"issuer": <did/id>, "svn": <n>,
+# "containers": [<container-policy>, ...]}`. Because a feed is an OCI reference
+# (`myregistry.io/fragments/sidecar`) and not a Rego identifier, a fragment writes that key by
+# declaring its package with a quoted path segment:
+#
+#     package agent_policy.fragments["myregistry.io/fragments/sidecar"]
+#     issuer := "did:x509:..."
+#     svn := 3
+#     containers := [ ... ]
+#
+# The agent accepts that form only when the quoted segment equals the feed the SRM verified
+# from the fragment's own COSE envelope, so a fragment can only ever populate its own key and
+# never another publisher's. At genpolicy generation time no fragment is loaded
+# (`data.agent_policy.fragments` is empty) and an unloaded / under-versioned / wrong-issuer
+# fragment contributes nothing => behaviour identical to a monolithic policy (no regression).
+
+# The full allowed-container set: base policy containers plus verified fragment-contributed
+# containers. All container-matching rules iterate this set.
+#
+# Each element carries a **stable reference** next to the container, because policy state
+# has to be able to name the container that authorized a running container_id, and the set
+# itself is not stable: `fragment_container_entries` is a comprehension over the fragments that
+# are *currently loaded*, so delivering another fragment inserts entries and shifts every
+# position after them. Recording a position would silently re-bind a running container to a
+# different policy entry the next time a fragment arrives, and the host chooses fragment
+# delivery order and timing. A reference names the source instead — the measured base array,
+# or a specific (feed, svn) — so it means the same thing however the combined set is
+# rebuilt.
+base_container_entries := [{"ref": {"base": true, "idx": i}, "container": c} |
+    some i, c in policy_data.containers
+]
+
+# A policy can declare a trusted fragment in two places, and both are measured, so both
+# have to be honoured here.
+#
+#   * `policy_data.fragments` — BL-7. Comes from `genpolicy-settings.json`, is serialized
+#     into `policy_data` at generation time, and is what a settings-driven deployment uses.
+#   * `policy_fragments` — BL-8. A rule in the generated policy text; this is the list the
+#     *agent* reads to decide what the host must deliver and what it must refuse.
+#
+# Reading only the first was a silent hole in the other direction from the usual one: a
+# fragment declared for delivery (BL-8), fetched by the host, verified by the SRM and
+# applied into the engine still contributed **no containers**, because the rule that reads
+# its contribution was looking at a list the BL-8 declaration never appears in. Nothing
+# reported an error — the fragment loaded, and the container it carried was simply refused.
+# Declaring the same fragment twice, in two different files, would have been the only way to
+# make it work, with divergence between the two failing silently.
+#
+# Duplicates across the two are harmless: they produce identical container entries with
+# identical references, and `container_by_ref` needs only one matching declaration.
+all_fragment_specs := array.concat(policy_data.fragments, policy_fragments)
+
+fragment_container_entries := [{"ref": {"feed": spec.feed, "svn": to_number(mod.svn), "idx": j}, "container": c} |
+    some spec in all_fragment_specs
+    mod := data.agent_policy.fragments[spec.feed]
+    mod.issuer == spec.issuer
+    to_number(mod.svn) >= spec.minimum_svn
+    some j, c in mod.containers
+]
+
+all_policy_container_entries := array.concat(base_container_entries, fragment_container_entries)
+
+# Resolve a reference recorded by CreateContainerRequest back to a policy container.
+#
+# The fragment arm re-runs the declaration gates rather than trusting the reference: the
+# fragment must still be one the measured base policy declares, from the issuer it declares,
+# at or above the declared SVN floor. The recorded SVN must match exactly, so a container
+# authorized by one version of a fragment is never later evaluated against the containers of
+# another version of it. Both arms are undefined when they do not hold, which makes the
+# calling rule undefined and falls through to the fail-closed default.
+container_by_ref(ref) := c if {
+    ref.base == true
+    c := policy_data.containers[ref.idx]
+}
+
+container_by_ref(ref) := c if {
+    not ref.base
+    some spec in all_fragment_specs
+    spec.feed == ref.feed
+    mod := data.agent_policy.fragments[ref.feed]
+    mod.issuer == spec.issuer
+    to_number(mod.svn) >= spec.minimum_svn
+    to_number(mod.svn) == ref.svn
+    c := mod.containers[ref.idx]
+}
+
+# ---- BL-8: delivery of fragments the base policy declares ----
+# Fragments the measured base policy declares in `policy_fragments[]` are fetched by the
+# host and pushed to the agent one at a time over LoadPolicyFragmentRequest. That endpoint
+# has to be policy-covered like every other one: an undefined rule makes allow_request bail,
+# which is fail-closed and therefore safe, but it is also indistinguishable from a rejected
+# fragment and it leaves the delivery path unusable.
+#
+# Each declaration carries an optional `required` flag, read by the agent and not by this
+# rule. It defaults to false, which is C-ACI/hcsshim behaviour: delivery is lazy, and a
+# fragment that never arrives contributes no grants, so anything only it would have
+# permitted is refused by the composed policy on its own merits. `required: true` is
+# stricter than C-ACI — it makes the declaration an obligation, so the agent refuses to
+# create any container until that fragment has been delivered and verified. Use it when the
+# fragment's absence is not fail-safe (a deny rule, an audit obligation, a constraint the
+# base policy assumes has been composed in). Either way a delivered fragment is verified
+# identically; `required` governs only whether absence is an error.
+#
+# A declaration may also carry `allow_nested`, which decides whether the fragment it names
+# may itself declare further fragments, and whose. It is absent by default, meaning no
+# delegation, so a policy written before the attribute existed cannot acquire the capability
+# by upgrade. The accepted forms are `false` / "none", "same-issuer" (the delivering
+# fragment's own issuer only), "any-authorized" (any issuer the measured trust root
+# authorizes), or an explicit list of issuer strings. Bare `true` is rejected by the agent
+# because it enables delegation without saying to whom.
+#
+# Delegation does not widen trust. A nested declaration only says a feed is expected; the
+# fragment behind it must still be signed by an issuer the measured trust root authorizes,
+# and the issuer-wide SVN floor still binds, so a nested declaration can raise the bar but
+# never lower it. Nested declarations live in the delivering fragment's signed Rego module
+# (at `policy_fragments` inside its own package), so they are covered by the same COSE
+# signature as everything else it carries and the host cannot edit them.
+#
+# The rule is coarse by construction, because the request carries nothing finer to bind to.
+# The host sends only the COSE envelope: issuer, feed and SVN are derived from the bytes the
+# guest verifies rather than from anything the host asserts, precisely so that a lying host
+# cannot describe a fragment into acceptance. Coarse is sufficient here. The Security
+# Reference Monitor verifies the envelope against the measured trust anchors and refuses
+# anything not signed by a declared issuer at or above the declared minimum SVN, so a
+# permitted call grants the host no power beyond offering bytes -- its worst case is denial,
+# never bypass.
+#
+# What this rule adds is the outer bound: a policy that declares no fragments has no reason
+# to accept any, so the endpoint stays shut for it.
+#
+# `policy_fragments` must be *defined* for that to work. Rego's undefined-is-fail-closed
+# behaviour applies to evaluation, not to compilation: a bare reference to a rule nothing
+# declares is an unsafe variable, and regorus rejects the whole module rather than leaving
+# this one rule undefined. That is not fail-closed, it is fail-to-load -- the agent cannot
+# build its engine at all, so every request is refused and no pod can start. genpolicy does
+# not emit `policy_fragments` (only base policies that declare fragments append it), which
+# is the ordinary case, so the default below is what keeps the ordinary case working.
+default policy_fragments := []
+
+default LoadPolicyFragmentRequest := false
+
+LoadPolicyFragmentRequest if {
+    count(policy_fragments) > 0
+}
+
+# ---------------------------------------------------------------------------
+# FR-8 / RM-64: denial reasons.
+#
+# When a request is refused, the endpoint rule simply fails to produce a value and the
+# agent has nothing to tell the operator beyond "denied". The only diagnostic available
+# was the `print()` trace, which is unstructured, is the largest thing in the message,
+# and is truncated by containerd before it reaches anyone -- so three unrelated defects
+# (a dm-verity gap, an inverted partition ordering and a Root.Readonly mismatch) all
+# presented as the same opaque failure.
+#
+# This mirrors the C-ACI baseline, whose Rego framework accumulates a set of failure
+# strings (`data.framework.errors`) and exposes them through `data.policy.reason`, which
+# the enforcer queries on denial. The agent does the same: on refusal it re-evaluates
+# `data.agent_policy.reason` with `rule` set to the endpoint name.
+#
+# Two properties this deliberately keeps:
+#
+#   - **Diagnostic only.** Nothing here participates in the allow decision. The agent
+#     evaluates it *after* the request has already been refused, so a bug in this section
+#     can make a message wrong but cannot make a denied request succeed. That is also why
+#     injecting `rule` into the input is safe even if a request ever carried that field.
+#
+#   - **Names, never values.** Environment variables are reported by name only and
+#     command arguments are not reported at all, matching the redaction the baseline
+#     applies before a decision leaves the guest. Paths, mount destinations, root hashes
+#     and partition numbers *are* reported: all of them appear in the policy itself, so
+#     they reveal nothing the holder of the policy does not already have.
+#
+# The set is a set of *candidate* explanations, not a single root cause. Each entry means
+# "no policy container satisfied this particular check", so several can be true at once
+# and a container failing two checks contributes two entries. That is the same semantics
+# the baseline has, and it is more useful than guessing which one mattered.
+# ---------------------------------------------------------------------------
+
+reason := {"errors": errors}
+
+# A container id may only be used once per sandbox (RM-20). This is checked before any
+# candidate is considered, so it is reported on its own.
+errors[msg] if {
+    input.rule == "CreateContainerRequest"
+    get_state_val(retired_key(input.container_id))
+    msg := sprintf("container id %v has already been used in this sandbox and cannot be reused", [input.container_id])
+}
+
+errors["the policy declares no containers, so no CreateContainerRequest can be allowed"] if {
+    input.rule == "CreateContainerRequest"
+    count(all_policy_container_entries) == 0
+}
+
+# Below: one error per discriminating field, emitted when *no* candidate container agrees
+# with the request on that field. Each names the presented value and the set of values the
+# policy would have accepted, which is the comparison an operator otherwise has to
+# reconstruct by hand from a truncated trace.
+
+errors[msg] if {
+    input.rule == "CreateContainerRequest"
+    count(all_policy_container_entries) > 0
+    not candidate_agrees_on_readonly
+    accepted := {c.container.OCI.Root.Readonly | some c in all_policy_container_entries}
+    msg := sprintf("Root.Readonly: request has %v, policy accepts %v", [input.OCI.Root.Readonly, accepted])
+}
+
+candidate_agrees_on_readonly if {
+    some entry in all_policy_container_entries
+    entry.container.OCI.Root.Readonly == input.OCI.Root.Readonly
+}
+
+errors[msg] if {
+    input.rule == "CreateContainerRequest"
+    count(all_policy_container_entries) > 0
+    not candidate_agrees_on_pidns
+    accepted := {c.container.sandbox_pidns | some c in all_policy_container_entries}
+    msg := sprintf("sandbox_pidns: request has %v, policy accepts %v", [input.sandbox_pidns, accepted])
+}
+
+candidate_agrees_on_pidns if {
+    some entry in all_policy_container_entries
+    entry.container.sandbox_pidns == input.sandbox_pidns
+}
+
+errors[msg] if {
+    input.rule == "CreateContainerRequest"
+    count(all_policy_container_entries) > 0
+    not candidate_agrees_on_oci_version
+    accepted := {c.container.OCI.Version | some c in all_policy_container_entries}
+    msg := sprintf("OCI.Version: request has %v, policy accepts %v", [input.OCI.Version, accepted])
+}
+
+candidate_agrees_on_oci_version if {
+    some entry in all_policy_container_entries
+    entry.container.OCI.Version == input.OCI.Version
+}
+
+errors[msg] if {
+    input.rule == "CreateContainerRequest"
+    count(all_policy_container_entries) > 0
+    i_namespace := input.OCI.Annotations[S_NAMESPACE_KEY]
+    not candidate_agrees_on_namespace
+    accepted := {c.container.OCI.Annotations[S_NAMESPACE_KEY] | some c in all_policy_container_entries}
+    msg := sprintf("sandbox namespace: request has %v, policy accepts %v", [i_namespace, accepted])
+}
+
+candidate_agrees_on_namespace if {
+    some entry in all_policy_container_entries
+    entry.container.OCI.Annotations[S_NAMESPACE_KEY] == input.OCI.Annotations[S_NAMESPACE_KEY]
+}
+
+# Command arguments are compared but never reported: unlike mounts and hashes they are
+# workload data rather than policy data, and the baseline redacts them for the same reason.
+errors["command: no policy container declares this container's argument list"] if {
+    input.rule == "CreateContainerRequest"
+    count(all_policy_container_entries) > 0
+    not candidate_agrees_on_args
+}
+
+candidate_agrees_on_args if {
+    some entry in all_policy_container_entries
+    entry.container.OCI.Process.Args == input.OCI.Process.Args
+}
+
+errors[msg] if {
+    input.rule == "CreateContainerRequest"
+    count(all_policy_container_entries) > 0
+    not candidate_agrees_on_cwd
+    accepted := {c.container.OCI.Process.Cwd | some c in all_policy_container_entries}
+    msg := sprintf("working directory: request has %v, policy accepts %v", [input.OCI.Process.Cwd, accepted])
+}
+
+candidate_agrees_on_cwd if {
+    some entry in all_policy_container_entries
+    entry.container.OCI.Process.Cwd == input.OCI.Process.Cwd
+}
+
+# Environment variables: names only. A value can be a password or a sealed secret, and the
+# name alone is enough to say which variable was not expected.
+errors[msg] if {
+    input.rule == "CreateContainerRequest"
+    count(all_policy_container_entries) > 0
+    unmatched := unmatched_env_names
+    count(unmatched) > 0
+    msg := sprintf("environment variables no policy container declares: %v", [unmatched])
+}
+
+unmatched_env_names := {name |
+    some i_env in input.OCI.Process.Env
+    not env_declared_by_some_candidate(i_env)
+    name := split(i_env, "=")[0]
+}
+
+env_declared_by_some_candidate(i_env) if {
+    some entry in all_policy_container_entries
+    some p_env in entry.container.OCI.Process.Env
+    p_env == i_env
+}
+
+# Mount destinations. These are declared in the policy, so reporting them leaks nothing,
+# and "which mount was not expected" is the single most common create-container question.
+errors[msg] if {
+    input.rule == "CreateContainerRequest"
+    count(all_policy_container_entries) > 0
+    unmatched := unmatched_mount_destinations
+    count(unmatched) > 0
+    msg := sprintf("mount destinations no policy container declares: %v", [unmatched])
+}
+
+unmatched_mount_destinations := {dest |
+    some i_mount in input.OCI.Mounts
+    not mount_destination_declared_by_some_candidate(i_mount.destination)
+    dest := i_mount.destination
+}
+
+mount_destination_declared_by_some_candidate(dest) if {
+    some entry in all_policy_container_entries
+    some p_mount in entry.container.OCI.Mounts
+    p_mount.destination == dest
+}
+
+# Storage shape. A count mismatch is reported separately from a content mismatch because
+# the two have completely different causes: the first means the runtime and genpolicy
+# disagree about how the image is laid out (how many layers, whether a scratch device is
+# present), the second means they agree on the shape and disagree on what is in it.
+errors[msg] if {
+    input.rule == "CreateContainerRequest"
+    count(all_policy_container_entries) > 0
+    not candidate_agrees_on_storage_count
+    accepted := {count(c.container.storages) | some c in all_policy_container_entries}
+    msg := sprintf("storage count: request presents %v storages, policy declares %v", [count(input.storages), accepted])
+}
+
+candidate_agrees_on_storage_count if {
+    some entry in all_policy_container_entries
+    count(entry.container.storages) == count(input.storages)
+}
+
+# dm-verity root hashes (RM-42). Reported with the partition number each was presented on,
+# because a *correct* set of hashes on the *wrong* partitions is a real and previously
+# observed failure (RM-62) that is otherwise indistinguishable from a genuine content
+# mismatch -- the hashes match byte for byte and only the positions are swapped.
+errors[msg] if {
+    input.rule == "CreateContainerRequest"
+    count(all_policy_container_entries) > 0
+    presented := presented_verity_roothashes
+    count(presented) > 0
+    declared := declared_verity_roothashes
+    presented != declared
+    msg := sprintf("dm-verity layers: request presents %v, policy declares %v (hashes that match but sit on different partition numbers mean the layer ordering disagrees, not the layer contents)", [presented, declared])
+}
+
+presented_verity_roothashes := {entry |
+    some i_storage in input.storages
+    i_storage.fstype == "erofs"
+    some o in i_storage.options
+    startswith(o, "X-kata.dmverity.roothash=")
+    some p in i_storage.options
+    startswith(p, "X-kata.dmverity.partition-number=")
+    entry := sprintf("partition %v = %v", [trim_prefix(p, "X-kata.dmverity.partition-number="), trim_prefix(o, "X-kata.dmverity.roothash=")])
+}
+
+declared_verity_roothashes := {entry |
+    some c in all_policy_container_entries
+    some p_storage in c.container.storages
+    p_storage.driver == "erofs-verity-layer"
+    some o in p_storage.options
+    startswith(o, "X-kata.dmverity.roothash=")
+    some p in p_storage.options
+    startswith(p, "X-kata.dmverity.partition-number=")
+    entry := sprintf("partition %v = %v", [trim_prefix(p, "X-kata.dmverity.partition-number="), trim_prefix(o, "X-kata.dmverity.roothash=")])
+}
+
+# ExecProcessRequest is the other endpoint an operator hits routinely, and its denial is
+# even more opaque because there is no candidate list to inspect -- the request simply is
+# not in the allow list.
+errors[msg] if {
+    input.rule == "ExecProcessRequest"
+    msg := sprintf("no policy rule permits this exec; the command must match a declared exec_process entry or an ExecProcessRequest.regex in the policy settings (requested command has %v arguments)", [count(input.process.Args)])
 }

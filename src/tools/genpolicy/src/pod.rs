@@ -129,6 +129,9 @@ pub struct Container {
     securityContext: Option<SecurityContext>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
+    workingDir: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub volumeMounts: Option<Vec<VolumeMount>>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -389,6 +392,43 @@ struct SecurityContext {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     seccompProfile: Option<SeccompProfile>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    appArmorProfile: Option<AppArmorProfile>,
+}
+
+/// See Reference / Kubernetes API / Workload Resources / Pod (AppArmorProfile).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AppArmorProfile {
+    #[serde(rename = "type")]
+    pub profile_type: String,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub localhostProfile: Option<String>,
+}
+
+/// Derive the OCI ApparmorProfile that containerd would forward for a given k8s
+/// appArmorProfile, overriding the settings-derived default only when the pod
+/// spec pins an explicit profile:
+/// - Localhost -> Some(localhostProfile) (containerd forwards the name verbatim).
+/// - Unconfined -> Some("") (containerd applies no profile).
+/// - RuntimeDefault / unspecified -> keep the settings-derived value (which may
+///   be None, i.e. left unconstrained, when no expected default is configured).
+pub fn apply_apparmor_profile(
+    process: &mut policy::KataProcess,
+    profile: &Option<AppArmorProfile>,
+) {
+    if let Some(p) = profile {
+        match p.profile_type.as_str() {
+            "Localhost" => {
+                process.ApparmorProfile = Some(p.localhostProfile.clone().unwrap_or_default());
+            }
+            "Unconfined" => {
+                process.ApparmorProfile = Some(String::new());
+            }
+            _ => {}
+        }
+    }
 }
 
 /// See Reference / Kubernetes API / Workload Resources / Pod.
@@ -421,6 +461,9 @@ pub struct PodSecurityContext {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub allowPrivilegeEscalation: Option<bool>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub appArmorProfile: Option<AppArmorProfile>,
 }
 
 /// See Reference / Kubernetes API / Workload Resources / Pod.
@@ -438,6 +481,54 @@ struct Lifecycle {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     preStop: Option<LifecycleHandler>,
+
+    /// K8s 1.33 `lifecycle.stopSignal`: the signal the kubelet sends to stop this
+    /// container. When present it is the container's own declaration of which signal
+    /// it expects, so the policy narrows the per-container signal set to it (F-76).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stopSignal: Option<String>,
+}
+
+/// Signal name -> number, for the Linux architectures kata supports (x86_64, aarch64,
+/// s390x and ppc64le share these numbers; only mips/alpha differ, and neither is a kata
+/// target). Used to translate `lifecycle.stopSignal` into the numeric set `rules.rego`
+/// compares against `SignalProcessRequest.signal`.
+fn signal_number(name: &str) -> Option<u32> {
+    let n = match name.trim().to_ascii_uppercase().as_str() {
+        "SIGHUP" => 1,
+        "SIGINT" => 2,
+        "SIGQUIT" => 3,
+        "SIGILL" => 4,
+        "SIGTRAP" => 5,
+        "SIGABRT" | "SIGIOT" => 6,
+        "SIGBUS" => 7,
+        "SIGFPE" => 8,
+        "SIGKILL" => 9,
+        "SIGUSR1" => 10,
+        "SIGSEGV" => 11,
+        "SIGUSR2" => 12,
+        "SIGPIPE" => 13,
+        "SIGALRM" => 14,
+        "SIGTERM" => 15,
+        "SIGSTKFLT" => 16,
+        "SIGCHLD" => 17,
+        "SIGCONT" => 18,
+        "SIGSTOP" => 19,
+        "SIGTSTP" => 20,
+        "SIGTTIN" => 21,
+        "SIGTTOU" => 22,
+        "SIGURG" => 23,
+        "SIGXCPU" => 24,
+        "SIGXFSZ" => 25,
+        "SIGVTALRM" => 26,
+        "SIGPROF" => 27,
+        "SIGWINCH" => 28,
+        "SIGIO" | "SIGPOLL" => 29,
+        "SIGPWR" => 30,
+        "SIGSYS" => 31,
+        _ => return None,
+    };
+    Some(n)
 }
 
 /// See Reference / Kubernetes API / Workload Resources / Pod.
@@ -773,6 +864,17 @@ impl Container {
         }
 
         (yaml_has_command, yaml_has_args)
+    }
+
+    /// F-76: the container's own stop signal, if the pod spec declares one
+    /// (`lifecycle.stopSignal`, K8s 1.33+). Returns `None` when unset or when the name is
+    /// not a signal this policy knows, in which case the caller falls back to the
+    /// settings-wide default set.
+    pub fn get_stop_signal(&self) -> Option<u32> {
+        self.lifecycle
+            .as_ref()
+            .and_then(|l| l.stopSignal.as_deref())
+            .and_then(signal_number)
     }
 
     pub fn get_exec_commands(&self) -> Vec<Vec<String>> {
@@ -1143,8 +1245,20 @@ impl Container {
             self.registry.image
         );
 
+        // A k8s container.workingDir overrides the image's WorkingDir. When unset,
+        // the value derived from the container image (registry) is retained.
+        if let Some(working_dir) = &self.workingDir {
+            if !working_dir.is_empty() {
+                process.Cwd = working_dir.clone();
+                debug!("get_process_fields: set Cwd from workingDir = {working_dir}");
+            }
+        }
+
         if let Some(context) = &self.securityContext {
             debug!("get_process_fields: securityContext = {:?}", context);
+
+            // Container-level appArmorProfile overrides any pod-level default.
+            apply_apparmor_profile(process, &context.appArmorProfile);
 
             if let Some(uid) = context.runAsUser {
                 debug!("get_process_fields: runAsUser uid = {uid}");
@@ -1274,6 +1388,7 @@ pub async fn add_pause_container(containers: &mut Vec<Container>, config: &Confi
             runAsUser: None,
             runAsGroup: None,
             seccompProfile: None,
+            appArmorProfile: None,
         }),
         ..Default::default()
     };

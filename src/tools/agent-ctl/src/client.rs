@@ -301,6 +301,11 @@ static AGENT_CMDS: &[AgentCmd] = &[
         fp: agent_cmd_sandbox_set_policy,
     },
     AgentCmd {
+        name: "LoadPolicyFragment",
+        st: ServiceType::Agent,
+        fp: agent_cmd_load_policy_fragment,
+    },
+    AgentCmd {
         name: "MemAgentMemcgSet",
         st: ServiceType::Agent,
         fp: agent_cmd_mem_agent_memcg_set,
@@ -2209,6 +2214,73 @@ fn agent_cmd_sandbox_add_swap(
     info!(sl!(), "response received";
         "response" => format!("{:?}", reply));
 
+    Ok(())
+}
+
+// FR-1: load a signed policy fragment. Arguments are space-separated key=value pairs to
+// avoid protobuf-bytes-in-JSON ambiguity:
+//   LoadPolicyFragment cose=<hex> receipt=<r> receipt_ledger=<ledger-id> \
+//       proof=<ttl-proof-file> extra_receipts=<ledger>:<hex>,...
+//
+// F-151: the fragment is carried entirely by the COSE_Sign1 envelope, matching what
+// runtime-rs sends. The guest derives issuer, feed, SVN, grants, includes, requires,
+// the module and the ordering head from the envelope it verifies, and now rejects a
+// request that tries to describe any of them. The receipt fields are countersignatures
+// over the same signed bytes rather than part of them, so they stay separate.
+fn agent_cmd_load_policy_fragment(
+    ctx: &Context,
+    client: &AgentServiceClient,
+    _health: &HealthClient,
+    _options: &mut Options,
+    args: &str,
+) -> Result<()> {
+    let mut kv = std::collections::HashMap::new();
+    for tok in args.split_whitespace() {
+        if let Some((k, v)) = tok.split_once('=') {
+            kv.insert(k.to_string(), v.to_string());
+        }
+    }
+    let get = |k: &str| kv.get(k).cloned().unwrap_or_default();
+
+    let hex_decode = |s: &str| -> Result<Vec<u8>> {
+        let s = s.trim();
+        if s.len() % 2 != 0 {
+            return Err(anyhow!("hex string has odd length"));
+        }
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).map_err(|e| anyhow!("bad hex: {e}")))
+            .collect()
+    };
+
+    let mut req = protocols::agent::LoadPolicyFragmentRequest::new();
+    req.cose_sign1 = match kv.get("cose") {
+        Some(c) if !c.is_empty() => hex_decode(c)?,
+        _ => return Err(anyhow!("cose=<hex> is required: the guest accepts only a COSE_Sign1 envelope")),
+    };
+    req.receipt = get("receipt");
+    req.receipt_ledger = get("receipt_ledger");
+    // FR-1f Stage 2: transparency inclusion + consistency proof (from a file or inline).
+    if let Some(pf) = kv.get("proof") {
+        if !pf.is_empty() {
+            req.receipt_proof = match std::fs::read_to_string(pf) {
+                Ok(s) => s,
+                Err(_) => pf.clone(),
+            };
+        }
+    }
+    req.extra_receipts = get("extra_receipts")
+        .split(',')
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .collect();
+
+    let ctx = clone_context(ctx);
+    info!(sl!(), "sending request"; "request" => format!("{:?}", req));
+    let reply = client
+        .load_policy_fragment(ctx, &req)
+        .map_err(|e| anyhow!("{:?}", e).context(ERR_API_FAILED))?;
+    info!(sl!(), "response received"; "response" => format!("{:?}", reply));
     Ok(())
 }
 

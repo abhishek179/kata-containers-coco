@@ -11,14 +11,14 @@ use kata_agent_policy::policy::AgentPolicy;
 
 async fn allow_request(policy: &mut AgentPolicy, ep: &str, request: &str) -> ttrpc::Result<()> {
     match policy.allow_request(ep, request).await {
-        Ok((allowed, prints)) => {
+        Ok((allowed, explanation)) => {
             if allowed {
                 Ok(())
             } else {
-                Err(ttrpc_error(
-                    ttrpc::Code::PERMISSION_DENIED,
-                    format!("{ep} is blocked by policy: {prints}"),
-                ))
+                // `explanation` already names the endpoint and the checks that failed, so
+                // this does not prefix it further: every byte spent here is a byte of the
+                // reason that containerd truncates away.
+                Err(ttrpc_error(ttrpc::Code::PERMISSION_DENIED, explanation))
             }
         }
         Err(e) => Err(ttrpc_error(
@@ -41,6 +41,9 @@ pub async fn is_allowed_with_entrypoint(
     allow_request(&mut policy, ep, &request).await
 }
 
+/// Handle the `SetPolicy` RPC. Compiled out in strict builds, where policy is delivered
+/// exclusively through initdata and there is no host-facing policy mutation channel.
+#[cfg(not(feature = "strict-policy"))]
 pub async fn do_set_policy(req: &protocols::agent::SetPolicyRequest) -> ttrpc::Result<()> {
     let request = serde_json::to_string(req).unwrap();
     let mut policy = AGENT_POLICY.lock().await;

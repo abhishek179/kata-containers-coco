@@ -10,7 +10,52 @@ use crate::utils::toml as toml_utils;
 use anyhow::Result;
 use log::{info, warn};
 use std::fs;
+
+/// Build the `mkfs_options` array for containerd's EROFS differ.
+///
+/// Every option here exists to make a layer's EROFS image a pure function of the
+/// layer's content, so that its dm-verity root hash can be predicted ahead of time.
+///
+/// Deliberately absent: `-U`. The filesystem UUID is the last source of
+/// non-determinism once the timestamp and sort order are pinned, but containerd's
+/// differ already supplies one of its own, derived from the layer's descriptor:
+///
+///     uuid.NewSHA1(uuid.NameSpaceURL, []byte("erofs:blobs/"+desc.Digest))
+///
+/// and appends it *after* the options configured here. mkfs.erofs honours the last
+/// `-U` on the command line, so anything we pass is silently discarded. containerd's
+/// value is strictly better than a fixed one: it is deterministic *and* distinct per
+/// layer, so identical layer content in different images does not collapse onto a
+/// shared UUID. See RM-46.
+fn erofs_mkfs_options() -> String {
+    "[\"-T0\",\"--mkfs-time\",\"--sort=none\"]".to_string()
+}
+
+/// Bind the transfer service's unpacker for the `erofs` snapshotter to the `erofs`
+/// differ, so layer construction cannot silently fall back to a path that produces
+/// no dm-verity metadata. See RM-50 and the call site for why this matters.
+fn erofs_unpack_config() -> String {
+    "[{platform = \"linux/amd64\", snapshotter = \"erofs\", differ = \"erofs\"}, \
+     {platform = \"linux/arm64\", snapshotter = \"erofs\", differ = \"erofs\"}]"
+        .to_string()
+}
 use std::path::Path;
+
+/// Reject dm-verity on the merged EROFS layout (RM-40).
+///
+/// Split out from `configure_erofs_snapshotter` so the rule itself can be tested
+/// without constructing a full `Config` and touching the filesystem.
+fn check_dmverity_requires_unmerged(erofs_dmverity: bool, unmerged: bool) -> Result<()> {
+    if erofs_dmverity && !unmerged {
+        return Err(anyhow::anyhow!(
+            "erofs snapshotter: EROFS_DMVERITY requires EROFS_MERGE_MODE=unmerged. \
+             In merged mode the dm-verity options are stripped before the storage is \
+             built, so layer content would be unverified despite dm-verity appearing \
+             to be enabled."
+        ));
+    }
+    Ok(())
+}
 
 pub async fn configure_erofs_snapshotter(config: &Config, configuration_file: &Path) -> Result<()> {
     info!("Configuring erofs-snapshotter");
@@ -20,6 +65,34 @@ pub async fn configure_erofs_snapshotter(config: &Config, configuration_file: &P
     // Go runtime can consume. In the default "merged" mode we force containerd
     // to merge layers into a single `fsmeta.erofs`, which is runtime-rs only.
     let unmerged = config.erofs_merge_mode.as_deref() == Some("unmerged");
+
+    // dm-verity layer integrity only exists in unmerged mode (RM-40).
+    //
+    // The GPT+VMDK path gives each layer its own block device and attaches
+    // dm-verity options per partition. The fsmerge path builds a single merged
+    // image and strips every `X-kata.` option before constructing the storage, so
+    // no roothash, salt or hashoffset can reach the guest even in principle.
+    // Enabling dm-verity on a merged deployment therefore produces a containerd
+    // config that genuinely writes per-layer dm-verity metadata which the runtime
+    // then silently ignores -- unverified container content on a deployment the
+    // operator has every reason to believe is verified. In a strict guest RM-31
+    // catches it, but only as an unexplained startup failure. Refuse the
+    // combination outright, mirroring the Go-shim guard above.
+    if config.erofs_dmverity && !unmerged {
+        warn!("##########################################################################");
+        warn!("#                                                                        #");
+        warn!("#  EROFS dm-verity was requested with the merged layer layout.           #");
+        warn!("#                                                                        #");
+        warn!("#  dm-verity verifies erofs lower layers per block device, which only    #");
+        warn!("#  exists in unmerged mode. In merged mode the metadata is generated     #");
+        warn!("#  and then discarded, leaving container content UNVERIFIED while        #");
+        warn!("#  appearing to be protected.                                            #");
+        warn!("#                                                                        #");
+        warn!("#  Set EROFS_MERGE_MODE=unmerged, or disable EROFS_DMVERITY.             #");
+        warn!("#                                                                        #");
+        warn!("##########################################################################");
+    }
+    check_dmverity_requires_unmerged(config.erofs_dmverity, unmerged)?;
 
     // The Go runtime does not support fsmerged EROFS (fsmeta.erofs).
     // If the snapshotter handler mapping explicitly pairs a Go shim with
@@ -105,15 +178,46 @@ pub async fn configure_erofs_snapshotter(config: &Config, configuration_file: &P
     )?;
 
     // Erofs differ plugin options (requires erofs-utils >= 1.8.2 on the host).
+    //
+    // These make a layer's EROFS image, and therefore its dm-verity root hash, a
+    // deterministic function of the layer content: `-T0 --mkfs-time` pins the build
+    // timestamp and `--sort=none` removes tar ordering variance. The remaining
+    // variable, the filesystem UUID, is pinned by containerd itself to a value
+    // derived from the layer digest -- see erofs_mkfs_options(). Reproducibility is
+    // what lets a policy generator declare the hash a layer must have (RM-38/RM-46).
     toml_utils::set_toml_value(
         configuration_file,
         ".plugins.\"io.containerd.differ.v1.erofs\".mkfs_options",
-        "[\"-T0\",\"--mkfs-time\",\"--sort=none\"]",
+        &erofs_mkfs_options(),
     )?;
     toml_utils::set_toml_value(
         configuration_file,
         ".plugins.\"io.containerd.differ.v1.erofs\".enable_tar_index",
         "false",
+    )?;
+
+    // Force image pulls through the transfer service and bind it explicitly to the
+    // EROFS differ (RM-50).
+    //
+    // Only the differ builds a layer the way the policy expects: with the
+    // reproducibility options above, containerd's derived `-U`, and a dm-verity hash
+    // tree. When it is bypassed -- as the client-side unpacker used by
+    // `ctr image pull --local` does -- the EROFS *snapshotter* converts the extracted
+    // directory itself with a bare `mkfs.erofs --quiet -Enoinline_data <out> <dir>`.
+    // That embeds live mtimes and a random UUID and writes no dm-verity metadata at
+    // all, even with `enable_dmverity = true`. Such a layer can never match a
+    // policy-declared root hash, so it fails closed, but it fails as an opaque mount
+    // refusal. Stating both settings makes the verified configuration explicit rather
+    // than a happy accident of containerd's fallback ordering.
+    toml_utils::set_toml_value(
+        configuration_file,
+        ".plugins.\"io.containerd.cri.v1.images\".use_local_image_pull",
+        "false",
+    )?;
+    toml_utils::set_toml_value(
+        configuration_file,
+        ".plugins.\"io.containerd.transfer.v1.local\".unpack_config",
+        &erofs_unpack_config(),
     )?;
 
     toml_utils::set_toml_value(
@@ -429,4 +533,104 @@ pub async fn uninstall_snapshotter(snapshotter: &str, config: &Config) -> Result
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The differ options must pin every input that would otherwise vary between
+    /// builds of identical layer content. Dropping any of these silently breaks
+    /// reproducibility of the dm-verity root hash, which a policy generator relies
+    /// on being able to predict, so assert on each one individually.
+    #[test]
+    fn erofs_mkfs_options_pin_all_sources_of_nondeterminism() {
+        let opts = erofs_mkfs_options();
+
+        // Build timestamp.
+        assert!(opts.contains("\"-T0\""), "missing -T0 in {opts}");
+        assert!(opts.contains("\"--mkfs-time\""), "missing --mkfs-time in {opts}");
+        // Tar entry ordering.
+        assert!(opts.contains("\"--sort=none\""), "missing --sort=none in {opts}");
+    }
+
+    /// RM-40: dm-verity on the merged layout is the one combination that must be
+    /// refused. It is not merely unsupported -- it produces a deployment that looks
+    /// verified and is not, because the runtime strips the dm-verity options before
+    /// building the storage. Every other combination must still be allowed.
+    #[test]
+    fn dmverity_is_refused_on_the_merged_layout() {
+        assert!(check_dmverity_requires_unmerged(true, false).is_err());
+
+        assert!(check_dmverity_requires_unmerged(true, true).is_ok());
+        assert!(check_dmverity_requires_unmerged(false, false).is_ok());
+        assert!(check_dmverity_requires_unmerged(false, true).is_ok());
+    }
+
+    /// The error has to name both knobs, since the operator set one of them and has
+    /// no reason to suspect the other is involved.
+    #[test]
+    fn dmverity_merge_mode_error_names_both_settings() {
+        let err = check_dmverity_requires_unmerged(true, false).unwrap_err().to_string();
+        assert!(err.contains("EROFS_DMVERITY"), "{err}");
+        assert!(err.contains("EROFS_MERGE_MODE=unmerged"), "{err}");
+    }
+
+    /// The unpack binding is the difference between layers that carry dm-verity and
+    /// layers that silently do not, so it must name the erofs differ for every
+    /// platform we build and must be valid TOML -- an unparseable value would take
+    /// containerd down rather than degrade it (RM-50).
+    #[test]
+    fn erofs_unpack_config_binds_the_differ_and_is_valid_toml() {
+        let cfg = erofs_unpack_config();
+        let doc: toml_edit::DocumentMut = format!("unpack_config = {cfg}")
+            .parse()
+            .expect("unpack_config must be TOML");
+        let entries = doc["unpack_config"]
+            .as_array()
+            .expect("array of inline tables");
+        assert_eq!(entries.len(), 2, "one entry per supported platform");
+        let mut platforms = Vec::new();
+        for entry in entries.iter() {
+            let table = entry.as_inline_table().expect("inline table");
+            assert_eq!(table["snapshotter"].as_str(), Some("erofs"));
+            assert_eq!(
+                table["differ"].as_str(),
+                Some("erofs"),
+                "bypassing the erofs differ produces layers with no dm-verity metadata"
+            );
+            platforms.push(table["platform"].as_str().unwrap().to_string());
+        }
+        assert!(platforms.contains(&"linux/amd64".to_string()));
+        assert!(platforms.contains(&"linux/arm64".to_string()));
+    }
+
+    /// containerd's differ appends its own `-U <uuid-of-layer-digest>` after these
+    /// options, and mkfs.erofs honours the last one, so passing our own would be
+    /// dead configuration that misleads a reader into thinking reproducibility
+    /// depends on it. Guard against it being reintroduced (RM-46).
+    #[test]
+    fn erofs_mkfs_options_do_not_pass_a_uuid() {
+        let opts = erofs_mkfs_options();
+        assert!(
+            !opts.contains("-U"),
+            "containerd overrides any -U we pass; remove it from {opts}"
+        );
+    }
+
+    /// The options are written into containerd's TOML as a literal array, so a
+    /// quoting mistake would produce a malformed config rather than a build error.
+    #[test]
+    fn erofs_mkfs_options_parse_as_a_toml_string_array() {
+        let doc = format!("opts = {}", erofs_mkfs_options())
+            .parse::<toml_edit::DocumentMut>()
+            .expect("mkfs_options is not valid TOML");
+        let arr = doc["opts"].as_array().expect("not an array");
+        assert_eq!(
+            arr.iter()
+                .map(|v| v.as_str().expect("non-string element"))
+                .collect::<Vec<_>>(),
+            vec!["-T0", "--mkfs-time", "--sort=none"]
+        );
+    }
 }

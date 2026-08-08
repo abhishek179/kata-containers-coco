@@ -7,13 +7,14 @@
 mod tests {
     use anyhow::Context;
     use std::fmt::{self, Display};
-    use std::fs::{self, File};
+    use std::fs;
     use std::path;
     use std::str;
 
     use protocols::agent::{
         AddARPNeighborsRequest, CreateContainerRequest, CreateSandboxRequest, ExecProcessRequest,
-        RemoveContainerRequest, UpdateInterfaceRequest, UpdateRoutesRequest,
+        RemoveContainerRequest, SignalProcessRequest, StartContainerRequest, StatsContainerRequest,
+        TtyWinResizeRequest, UpdateInterfaceRequest, UpdateRoutesRequest, WaitProcessRequest,
     };
     use serde::{Deserialize, Serialize};
 
@@ -30,6 +31,11 @@ mod tests {
         CreateSandboxRequest(CreateSandboxRequest),
         ExecProcessRequest(ExecProcessRequest),
         RemoveContainerRequest(RemoveContainerRequest),
+        SignalProcessRequest(SignalProcessRequest),
+        StartContainerRequest(StartContainerRequest),
+        StatsContainerRequest(StatsContainerRequest),
+        TtyWinResizeRequest(TtyWinResizeRequest),
+        WaitProcessRequest(WaitProcessRequest),
         UpdateInterfaceRequest(UpdateInterfaceRequest),
         UpdateRoutesRequest(UpdateRoutesRequest),
         AddARPNeighborsRequest(AddARPNeighborsRequest),
@@ -43,6 +49,11 @@ mod tests {
                 TestRequest::CreateSandboxRequest(_) => write!(f, "CreateSandboxRequest"),
                 TestRequest::ExecProcessRequest(_) => write!(f, "ExecProcessRequest"),
                 TestRequest::RemoveContainerRequest(_) => write!(f, "RemoveContainerRequest"),
+                TestRequest::SignalProcessRequest(_) => write!(f, "SignalProcessRequest"),
+                TestRequest::StartContainerRequest(_) => write!(f, "StartContainerRequest"),
+                TestRequest::StatsContainerRequest(_) => write!(f, "StatsContainerRequest"),
+                TestRequest::TtyWinResizeRequest(_) => write!(f, "TtyWinResizeRequest"),
+                TestRequest::WaitProcessRequest(_) => write!(f, "WaitProcessRequest"),
                 TestRequest::UpdateInterfaceRequest(_) => write!(f, "UpdateInterfaceRequest"),
                 TestRequest::UpdateRoutesRequest(_) => write!(f, "UpdateRoutesRequest"),
                 TestRequest::AddARPNeighborsRequest(_) => write!(f, "AddARPNeighborsRequest"),
@@ -163,10 +174,11 @@ mod tests {
 
         // Run through the test cases and evaluate the canned requests.
 
-        let case_file =
-            File::open(testdata_dir.join("testcases.json")).expect("test case file should open");
+        let raw_cases =
+            fs::read_to_string(testdata_dir.join("testcases.json")).expect("test cases readable");
         let test_cases: Vec<TestCase> =
-            serde_json::from_reader(case_file).expect("test case file should parse");
+            serde_json::from_str(&resolve_roothashes(&raw_cases, &policy))
+                .expect("test case file should parse");
 
         for test_case in test_cases {
             println!("\n== case: {} ==\n", test_case.description);
@@ -190,6 +202,41 @@ mod tests {
                 logs, results.1
             );
         }
+    }
+
+    /// Resolve `$(roothash-N)` placeholders in a test case file against the root
+    /// hashes the generated policy actually declares, in declaration order.
+    ///
+    /// RM-42 derives each EROFS layer's dm-verity root hash from the layer content
+    /// and the host's erofs-utils version, so the values are not knowable when the
+    /// fixture is written. Baking them in would either make the suite depend on a
+    /// particular erofs-utils build or -- worse -- leave stale hashes behind, which
+    /// would make every negative case deny for the wrong reason and quietly stop
+    /// testing what it claims to test.
+    ///
+    /// Index 0 is the pause container's single layer; the workload container's
+    /// layers follow. A layer-count change breaks this loudly rather than silently.
+    fn resolve_roothashes(cases: &str, policy: &str) -> String {
+        let mut resolved = cases.to_string();
+        let hashes: Vec<&str> = policy
+            .match_indices("X-kata.dmverity.roothash=")
+            .filter_map(|(i, m)| {
+                let rest = &policy[i + m.len()..];
+                let hash = rest.get(..64)?;
+                hash.bytes()
+                    .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+                    .then_some(hash)
+            })
+            .collect();
+        for (index, hash) in hashes.iter().enumerate() {
+            resolved = resolved.replace(&format!("$(roothash-{index})"), hash);
+        }
+        assert!(
+            !resolved.contains("$(roothash-"),
+            "unresolved root hash placeholder: the policy declared {} layer(s)",
+            hashes.len()
+        );
+        resolved
     }
 
     fn decode_policy(initdata_anno: &str) -> String {
@@ -233,12 +280,17 @@ mod tests {
         let genpolicy_dir = path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
 
         for base in ["rules.rego", "genpolicy-settings.json"] {
-            fs::copy(genpolicy_dir.join(base), workdir.join(base))
-                .context(format!(
-                    "{:?} --> {:?}",
-                    genpolicy_dir.join(base),
-                    workdir.join(base)
-                ))
+            // A test case may ship its own settings to exercise a non-default
+            // configuration (e.g. image_layer_verification); fall back to the shipped
+            // defaults otherwise, so that most cases keep testing what users get.
+            let source = if testdata_dir.join(base).exists() {
+                testdata_dir.join(base)
+            } else {
+                genpolicy_dir.join(base)
+            };
+
+            fs::copy(&source, workdir.join(base))
+                .context(format!("{:?} --> {:?}", &source, workdir.join(base)))
                 .expect("copying files around should not fail");
         }
 
@@ -306,8 +358,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_state_signal_process() {
+        runtests("state/signalprocess").await;
+    }
+
+    #[tokio::test]
+    async fn test_state_remove_container() {
+        runtests("state/removecontainer").await;
+    }
+
+    #[tokio::test]
+    async fn test_state_start_container() {
+        runtests("state/startcontainer").await;
+    }
+
+    #[tokio::test]
+    async fn test_state_stats_container() {
+        runtests("state/statscontainer").await;
+    }
+
+    #[tokio::test]
+    async fn test_state_tty_win_resize() {
+        runtests("state/ttywinresize").await;
+    }
+
+    #[tokio::test]
+    async fn test_state_wait_process() {
+        runtests("state/waitprocess").await;
+    }
+
+    #[tokio::test]
     async fn test_state_exec_process_deployment() {
         runtests("state/execprocessdeployment").await;
+    }
+
+    #[tokio::test]
+    async fn test_create_container_image_short_name() {
+        runtests("createcontainer/image_short_name").await;
+    }
+
+    /// RM-51: the same request as `image_short_name`, but generated with
+    /// `require_pinned_image_digests` on. The tag-named guest-pull image must now be
+    /// denied — this is the check that replaced the removed `VerifiedImageStore`
+    /// unpinned-reference refusal in the guest.
+    #[tokio::test]
+    async fn test_create_container_require_pinned_images() {
+        runtests("createcontainer/require_pinned_images").await;
     }
 
     #[tokio::test]
@@ -326,8 +422,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_create_container_erofs_layers() {
+        // RM-38/RM-41: a container whose image layers are presented by the host as
+        // dm-verity backed erofs lower layers (containerd's erofs snapshotter in
+        // unmerged mode). Before RM-38 the generated policy said nothing about these
+        // storages at all, so such a workload could not run under policy; before RM-41
+        // the duplicate-identity check rejected every image with more than one layer,
+        // because all of a container's layers are partitions of a single block device
+        // and share driver, source and mount point.
+        runtests("createcontainer/erofs_layers").await;
+    }
+
+    #[tokio::test]
     async fn test_create_container_volumes_empty_dir() {
         runtests("createcontainer/volumes/emptydir").await;
+    }
+
+    #[tokio::test]
+    async fn test_create_container_volumes_empty_dir_memory() {
+        // RM-35 (F-97): a memory-backed emptyDir is declared as an in-guest tmpfs --
+        // driver "ephemeral", source "tmpfs" -- and is not one of the two declarations
+        // that opt into host-chosen block backing. Before RM-35 the blk/scsi bodies of
+        // storage_pair_matches ignored the declaration's driver and source entirely, so
+        // a host-attached disk carrying arbitrary content satisfied this declaration.
+        runtests("createcontainer/volumes/emptydir_memory").await;
     }
 
     #[tokio::test]
@@ -353,5 +471,13 @@ mod tests {
     #[tokio::test]
     async fn test_create_container_env_vars() {
         runtests("createcontainer/env_vars").await;
+    }
+
+    // FR-16: the policy exact-matches the OCI Process workingDir (Cwd), the
+    // apparmor profile pinned by the pod spec, and the process rlimits, so a
+    // compromised host cannot weaken these when starting a container.
+    #[tokio::test]
+    async fn test_create_container_fr16_oci_fields() {
+        runtests("createcontainer/fr16").await;
     }
 }
